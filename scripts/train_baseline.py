@@ -67,6 +67,14 @@ def parse_args() -> argparse.Namespace:
         help="Path to checkpoint (.pth) to resume training from.",
     )
     parser.add_argument(
+        "--resume-model-only",
+        action="store_true",
+        help=(
+            "Load only model/frontend weights from --resume and reset optimizer/scheduler/scaler "
+            "states. Useful when previous optimizer state causes instability."
+        ),
+    )
+    parser.add_argument(
         "--no-save-on-interrupt",
         action="store_true",
         help="Disable automatic interrupt checkpoint on Ctrl+C or termination.",
@@ -191,14 +199,15 @@ def validate_one_epoch(
     criterion: nn.Module,
     device: torch.device,
     use_amp: bool,
-) -> Tuple[float, float, np.ndarray, np.ndarray]:
+) -> Tuple[float, float, np.ndarray, np.ndarray, int, int]:
     model.eval()
     frontend.eval()
 
     running_loss = 0.0
     predictions = []
     targets_all = []
-    non_finite_val_batches = 0
+    bad_logits_batches = 0
+    bad_loss_batches = 0
 
     progress = tqdm(loader, desc="valid", leave=False)
     for waveforms, targets in progress:
@@ -211,10 +220,10 @@ def validate_one_epoch(
             loss = criterion(logits, targets)
 
         if not torch.isfinite(logits).all():
-            non_finite_val_batches += 1
+            bad_logits_batches += 1
             logits = torch.nan_to_num(logits, nan=0.0, posinf=20.0, neginf=-20.0)
         if not torch.isfinite(loss):
-            non_finite_val_batches += 1
+            bad_loss_batches += 1
             loss = torch.zeros((), device=targets.device, dtype=targets.dtype)
 
         probs = torch.sigmoid(logits)
@@ -226,15 +235,23 @@ def validate_one_epoch(
 
     y_pred = np.concatenate(predictions, axis=0)
     y_true = np.concatenate(targets_all, axis=0)
-    if non_finite_val_batches > 0:
+    if bad_logits_batches > 0 or bad_loss_batches > 0:
         print(
-            f"[WARN] Non-finite tensors appeared in {non_finite_val_batches} validation batches. "
-            "Sanitized to finite values for scoring.",
+            f"[WARN] Non-finite tensors in validation batches: logits={bad_logits_batches}, "
+            f"loss={bad_loss_batches}. Sanitized to finite values for scoring.",
             flush=True,
         )
     score = macro_auc_skip_empty(y_true, y_pred)
     val_loss = running_loss / len(loader.dataset)
-    return val_loss, score, y_true, y_pred
+    return val_loss, score, y_true, y_pred, bad_logits_batches, bad_loss_batches
+
+
+def count_non_finite_params(module: nn.Module) -> int:
+    total_bad = 0
+    for parameter in module.parameters():
+        bad = ~torch.isfinite(parameter.data)
+        total_bad += int(bad.sum().item())
+    return total_bad
 
 
 def build_checkpoint(
@@ -399,20 +416,33 @@ def main() -> None:
         model.load_state_dict(resume_ckpt["model_state_dict"], strict=True)
         if "frontend_state_dict" in resume_ckpt:
             frontend.load_state_dict(resume_ckpt["frontend_state_dict"], strict=False)
-        if "optimizer_state_dict" in resume_ckpt:
-            optimizer.load_state_dict(resume_ckpt["optimizer_state_dict"])
-        if "scheduler_state_dict" in resume_ckpt:
-            scheduler.load_state_dict(resume_ckpt["scheduler_state_dict"])
-        scaler_state = resume_ckpt.get("scaler_state_dict")
-        if scaler_state:
-            try:
-                scaler.load_state_dict(scaler_state)
-            except Exception as exc:
-                print(f"[WARN] Failed to load scaler state: {exc}")
 
         best_score = float(resume_ckpt.get("best_val_auc", best_score))
         start_epoch = int(resume_ckpt.get("epoch", 0)) + 1
         global_step = int(resume_ckpt.get("global_step", 0))
+        if args.resume_model_only:
+            print(
+                "[INFO] --resume-model-only enabled: optimizer/scheduler/scaler states were reset.",
+                flush=True,
+            )
+        else:
+            if "optimizer_state_dict" in resume_ckpt:
+                optimizer.load_state_dict(resume_ckpt["optimizer_state_dict"])
+            if "scheduler_state_dict" in resume_ckpt:
+                scheduler.load_state_dict(resume_ckpt["scheduler_state_dict"])
+            scaler_state = resume_ckpt.get("scaler_state_dict")
+            if scaler_state:
+                try:
+                    scaler.load_state_dict(scaler_state)
+                except Exception as exc:
+                    print(f"[WARN] Failed to load scaler state: {exc}")
+
+        bad_params = count_non_finite_params(model) + count_non_finite_params(frontend)
+        if bad_params > 0:
+            raise RuntimeError(
+                f"Resume checkpoint has {bad_params} non-finite parameters. "
+                "Try a different checkpoint (for example best_fold*.pth)."
+            )
         print(
             f"Resume state -> start_epoch={start_epoch}, global_step={global_step}, best_auc={best_score:.5f}"
         )
@@ -460,7 +490,14 @@ def main() -> None:
                 save_every_steps=args.save_every_steps,
                 on_step_checkpoint=on_step_checkpoint,
             )
-            val_loss, val_score, y_true, y_pred = validate_one_epoch(
+            bad_params = count_non_finite_params(model) + count_non_finite_params(frontend)
+            if bad_params > 0:
+                raise RuntimeError(
+                    f"Detected {bad_params} non-finite parameters after training epoch {epoch}. "
+                    "Model diverged. Lower LR / disable AMP / use --resume-model-only from best checkpoint."
+                )
+
+            val_loss, val_score, y_true, y_pred, bad_logits_batches, bad_loss_batches = validate_one_epoch(
                 model=model,
                 frontend=frontend,
                 loader=valid_loader,
@@ -468,6 +505,12 @@ def main() -> None:
                 device=device,
                 use_amp=use_amp,
             )
+            if bad_logits_batches >= len(valid_loader):
+                raise RuntimeError(
+                    "Validation logits are non-finite in all batches. "
+                    "Training has diverged. Stop and resume from best checkpoint with "
+                    "--resume-model-only and a lower learning rate."
+                )
             scheduler.step()
 
             if val_score > best_score:

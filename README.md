@@ -29,13 +29,12 @@ python scripts/train_baseline.py \
   --amp
 ```
 
-Long-running training options:
-- `--save-every-steps 200`: save rolling step checkpoint to `step_last_foldX.pth` every 200 optimizer steps
-- `--resume <path>`: resume from `last_foldX.pth` or `step_last_foldX.pth`
+Recommended: long-running background training with `nohup`.
 
-Example with periodic checkpointing:
+Start training in background (from scratch):
 ```bash
-PYTHONNOUSERSITE=1 python scripts/train_baseline.py \
+mkdir -p logs
+nohup env PYTHONNOUSERSITE=1 python scripts/train_baseline.py \
   --train-csv dataset/train.csv \
   --audio-dir dataset/train_audio \
   --output-dir outputs/fold0 \
@@ -44,24 +43,47 @@ PYTHONNOUSERSITE=1 python scripts/train_baseline.py \
   --epochs 12 \
   --batch-size 32 \
   --num-workers 4 \
-  --amp \
-  --save-every-steps 200
+  --learning-rate 1e-4 \
+  --mixup-alpha 0.0 \
+  --grad-clip-norm 1.0 \
+  --save-every-steps 200 \
+  > logs/fold0_nohup.log 2>&1 &
+echo $! > logs/fold0.pid
 ```
 
-Resume example:
+Resume training in background:
 ```bash
-PYTHONNOUSERSITE=1 python scripts/train_baseline.py \
+mkdir -p logs
+nohup env PYTHONNOUSERSITE=1 python scripts/train_baseline.py \
   --train-csv dataset/train.csv \
   --audio-dir dataset/train_audio \
   --output-dir outputs/fold0 \
   --folds 5 \
   --fold 0 \
-  --epochs 12 \
+  --epochs 16 \
   --batch-size 32 \
   --num-workers 4 \
-  --amp \
+  --learning-rate 1e-4 \
+  --mixup-alpha 0.0 \
+  --grad-clip-norm 1.0 \
   --save-every-steps 200 \
-  --resume outputs/fold0/last_fold0.pth
+  --resume outputs/fold0/last_fold0.pth \
+  > logs/fold0_resume.log 2>&1 &
+echo $! > logs/fold0_resume.pid
+```
+
+Notes:
+- `--save-every-steps 200`: save rolling checkpoint to `step_last_foldX.pth` every 200 optimizer steps.
+- `--resume <path>`: resume from `last_foldX.pth` or `step_last_foldX.pth`.
+- `--resume-model-only`: load only model weights from checkpoint, and reset optimizer/scheduler/scaler states (recommended when resumed training becomes unstable).
+- When resuming, set `--epochs` larger than the epoch already stored in checkpoint, otherwise it will print `Nothing to train`.
+- `best_fold0.pth` is best-by-validation (`val_auc`) for inference; `last_fold0.pth` is latest-progress for resume.
+
+Monitor / stop:
+```bash
+tail -f logs/fold0_nohup.log
+ps -fp $(cat logs/fold0.pid)
+kill $(cat logs/fold0.pid)
 ```
 
 If you see frequent `Non-finite loss detected (nan)`:
