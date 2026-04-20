@@ -104,6 +104,7 @@ class BirdTrainDataset(Dataset):
         waveform = crop_or_pad(
             waveform, num_samples=self.segment_samples, random_crop=self.is_train
         )
+        waveform = torch.nan_to_num(waveform, nan=0.0, posinf=0.0, neginf=0.0)
         target = self._build_target(row)
         return waveform, target
 

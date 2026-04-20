@@ -104,6 +104,13 @@ python -m pip install soundfile
 
 The loader in this repo now tries `torchaudio` first, then falls back to `soundfile`, then `librosa`.
 
+To audit dataset integrity (missing/corrupt audio):
+```bash
+python scripts/check_dataset_integrity.py \
+  --train-csv dataset/train.csv \
+  --audio-dir dataset/train_audio
+```
+
 ## Overview
 The goal of this competition is to develop machine learning frameworks capable of identifying understudied species within continuous audio data from Brazil's Pantanal wetlands. Successful solutions will help advance biodiversity monitoring in the last wild places on Earth.
 

@@ -99,7 +99,7 @@ def train_one_epoch(
     optimizer: torch.optim.Optimizer,
     criterion: nn.Module,
     device: torch.device,
-    scaler: torch.cuda.amp.GradScaler,
+    scaler,
     use_amp: bool,
     mixup_alpha: float,
 ) -> float:
@@ -108,16 +108,25 @@ def train_one_epoch(
     running_loss = 0.0
 
     progress = tqdm(loader, desc="train", leave=False)
+    skipped_batches = 0
     for waveforms, targets in progress:
         waveforms = waveforms.to(device, non_blocking=True)
         targets = targets.to(device, non_blocking=True)
 
         optimizer.zero_grad(set_to_none=True)
-        with torch.cuda.amp.autocast(enabled=use_amp):
+        with torch.amp.autocast(device_type=device.type, enabled=use_amp):
             features = frontend(waveforms)
             features, targets = mixup_batch(features, targets, alpha=mixup_alpha)
             logits = model(features)
             loss = criterion(logits, targets)
+
+        if not torch.isfinite(loss):
+            skipped_batches += 1
+            print(
+                f"[WARN] Non-finite loss detected ({loss.item()}). Skipping this batch.",
+                flush=True,
+            )
+            continue
 
         scaler.scale(loss).backward()
         scaler.step(optimizer)
@@ -126,7 +135,10 @@ def train_one_epoch(
         running_loss += float(loss.item()) * waveforms.size(0)
         progress.set_postfix(loss=f"{loss.item():.4f}")
 
-    return running_loss / len(loader.dataset)
+    if skipped_batches > 0:
+        print(f"[WARN] Skipped {skipped_batches} non-finite batches in this epoch.", flush=True)
+
+    return running_loss / max(1, len(loader.dataset))
 
 
 @torch.no_grad()
@@ -150,7 +162,7 @@ def validate_one_epoch(
         waveforms = waveforms.to(device, non_blocking=True)
         targets = targets.to(device, non_blocking=True)
 
-        with torch.cuda.amp.autocast(enabled=use_amp):
+        with torch.amp.autocast(device_type=device.type, enabled=use_amp):
             features = frontend(waveforms)
             logits = model(features)
             loss = criterion(logits, targets)
@@ -234,6 +246,10 @@ def main() -> None:
         optimizer, T_max=args.epochs, eta_min=args.learning_rate * 0.05
     )
     scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+    if hasattr(torch, "amp") and hasattr(torch.amp, "GradScaler"):
+        scaler = torch.amp.GradScaler(device="cuda", enabled=use_amp)
+    else:  # pragma: no cover - compatibility fallback
+        scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
 
     best_score = -1.0
     best_path = args.output_dir / f"best_fold{args.fold}.pth"
