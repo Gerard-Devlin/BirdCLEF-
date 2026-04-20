@@ -91,6 +91,19 @@ Then click `Save Version` + `Submit to Competition`.
 - Output file must be named `submission.csv`.
 - `infer_kaggle.py` aligns model labels to `sample_submission` columns automatically.
 
+### Troubleshooting: `Couldn't find appropriate backend ... .ogg`
+If training fails when reading OGG files, check available audio backends:
+```bash
+python -c "import torchaudio; print(torchaudio.list_audio_backends())"
+```
+
+Then install fallback decoder support:
+```bash
+python -m pip install soundfile
+```
+
+The loader in this repo now tries `torchaudio` first, then falls back to `soundfile`, then `librosa`.
+
 ## Overview
 The goal of this competition is to develop machine learning frameworks capable of identifying understudied species within continuous audio data from Brazil's Pantanal wetlands. Successful solutions will help advance biodiversity monitoring in the last wild places on Earth.
 
