@@ -7,6 +7,9 @@ from sklearn.metrics import roc_auc_score
 
 
 def macro_auc_skip_empty(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+    y_pred = np.nan_to_num(y_pred, nan=0.0, posinf=1.0, neginf=0.0)
+    y_pred = np.clip(y_pred, 0.0, 1.0)
+
     aucs: List[float] = []
     num_classes = y_true.shape[1]
 

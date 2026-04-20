@@ -6,6 +6,7 @@ import time
 from pathlib import Path
 from typing import Callable, Optional, Tuple
 import sys
+import site
 
 import numpy as np
 import pandas as pd
@@ -47,6 +48,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mixup-alpha", type=float, default=0.2)
     parser.add_argument("--dropout", type=float, default=0.3)
     parser.add_argument("--amp", action="store_true")
+    parser.add_argument(
+        "--grad-clip-norm",
+        type=float,
+        default=1.0,
+        help="Clip gradient norm. Set <=0 to disable clipping.",
+    )
     parser.add_argument(
         "--save-every-steps",
         type=int,
@@ -119,6 +126,7 @@ def train_one_epoch(
     scaler,
     use_amp: bool,
     mixup_alpha: float,
+    grad_clip_norm: float = 1.0,
     global_step_start: int = 0,
     save_every_steps: int = 0,
     on_step_checkpoint: Optional[Callable[[int], None]] = None,
@@ -151,6 +159,9 @@ def train_one_epoch(
             continue
 
         scaler.scale(loss).backward()
+        if grad_clip_norm > 0:
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip_norm)
         scaler.step(optimizer)
         scaler.update()
 
@@ -187,6 +198,7 @@ def validate_one_epoch(
     running_loss = 0.0
     predictions = []
     targets_all = []
+    non_finite_val_batches = 0
 
     progress = tqdm(loader, desc="valid", leave=False)
     for waveforms, targets in progress:
@@ -198,7 +210,15 @@ def validate_one_epoch(
             logits = model(features)
             loss = criterion(logits, targets)
 
-        probs = torch.sigmoid(logits).detach().cpu().numpy()
+        if not torch.isfinite(logits).all():
+            non_finite_val_batches += 1
+            logits = torch.nan_to_num(logits, nan=0.0, posinf=20.0, neginf=-20.0)
+        if not torch.isfinite(loss):
+            non_finite_val_batches += 1
+            loss = torch.zeros((), device=targets.device, dtype=targets.dtype)
+
+        probs = torch.sigmoid(logits)
+        probs = torch.nan_to_num(probs, nan=0.0, posinf=1.0, neginf=0.0).detach().cpu().numpy()
         gt = targets.detach().cpu().numpy()
         predictions.append(probs)
         targets_all.append(gt)
@@ -206,6 +226,12 @@ def validate_one_epoch(
 
     y_pred = np.concatenate(predictions, axis=0)
     y_true = np.concatenate(targets_all, axis=0)
+    if non_finite_val_batches > 0:
+        print(
+            f"[WARN] Non-finite tensors appeared in {non_finite_val_batches} validation batches. "
+            "Sanitized to finite values for scoring.",
+            flush=True,
+        )
     score = macro_auc_skip_empty(y_true, y_pred)
     val_loss = running_loss / len(loader.dataset)
     return val_loss, score, y_true, y_pred
@@ -258,6 +284,17 @@ def main() -> None:
     args = parse_args()
     args.output_dir.mkdir(parents=True, exist_ok=True)
     seed_everything(args.seed)
+    try:
+        user_site = site.getusersitepackages()
+    except Exception:
+        user_site = None
+    if user_site and user_site in sys.path:
+        print(
+            f"[WARN] User site-packages is active: {user_site}. "
+            "This can mix Python 3.13 local packages into conda env. "
+            "Use `PYTHONNOUSERSITE=1` when launching training.",
+            flush=True,
+        )
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     use_amp = args.amp and device.type == "cuda"
@@ -404,6 +441,7 @@ def main() -> None:
                 scaler=scaler,
                 use_amp=use_amp,
                 mixup_alpha=args.mixup_alpha,
+                grad_clip_norm=args.grad_clip_norm,
                 global_step_start=global_step,
                 save_every_steps=args.save_every_steps,
                 on_step_checkpoint=on_step_checkpoint,

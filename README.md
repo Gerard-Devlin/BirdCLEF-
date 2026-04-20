@@ -35,7 +35,7 @@ Long-running training options:
 
 Example with periodic checkpointing:
 ```bash
-python scripts/train_baseline.py \
+PYTHONNOUSERSITE=1 python scripts/train_baseline.py \
   --train-csv dataset/train.csv \
   --audio-dir dataset/train_audio \
   --output-dir outputs/fold0 \
@@ -50,7 +50,7 @@ python scripts/train_baseline.py \
 
 Resume example:
 ```bash
-python scripts/train_baseline.py \
+PYTHONNOUSERSITE=1 python scripts/train_baseline.py \
   --train-csv dataset/train.csv \
   --audio-dir dataset/train_audio \
   --output-dir outputs/fold0 \
@@ -63,6 +63,11 @@ python scripts/train_baseline.py \
   --save-every-steps 200 \
   --resume outputs/fold0/last_fold0.pth
 ```
+
+If you see frequent `Non-finite loss detected (nan)`:
+1. Retry without AMP (`remove --amp`)
+2. Lower learning rate (`--learning-rate 1e-4`)
+3. Keep gradient clipping enabled (`--grad-clip-norm 1.0`)
 
 Run multiple folds (example):
 ```bash
