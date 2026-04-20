@@ -4,7 +4,7 @@ import argparse
 import time
 from collections import defaultdict
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 import sys
 
 import numpy as np
@@ -33,6 +33,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--segment-seconds", type=float, default=5.0)
     parser.add_argument("--tta-flip", action="store_true", help="Average with time-flip TTA")
     parser.add_argument("--output", type=Path, default=Path("submission.csv"))
+    parser.add_argument(
+        "--strict-missing",
+        action="store_true",
+        help="Fail if a soundscape file referenced by row_id is missing.",
+    )
     return parser.parse_args()
 
 
@@ -45,11 +50,29 @@ def parse_row_id(row_id: str) -> Tuple[str, int]:
     return soundscape_id, end_second
 
 
-def resolve_soundscape_path(test_dir: Path, soundscape_id: str) -> Path:
+def build_soundscape_index(test_dir: Path) -> Dict[str, Path]:
+    index: Dict[str, Path] = {}
+    for file_path in test_dir.rglob("*"):
+        if file_path.is_file() and file_path.suffix.lower() in {".ogg", ".wav", ".flac", ".mp3"}:
+            index.setdefault(file_path.stem, file_path)
+    return index
+
+
+def resolve_soundscape_path(
+    test_dir: Path, soundscape_id: str, soundscape_index: Optional[Dict[str, Path]] = None
+) -> Path:
+    if soundscape_index and soundscape_id in soundscape_index:
+        return soundscape_index[soundscape_id]
+
     for ext in (".ogg", ".wav", ".flac", ".mp3"):
         candidate = test_dir / f"{soundscape_id}{ext}"
         if candidate.exists():
             return candidate
+    # Some competition inputs can nest files by folders.
+    for ext in (".ogg", ".wav", ".flac", ".mp3"):
+        matches = list(test_dir.rglob(f"{soundscape_id}{ext}"))
+        if matches:
+            return matches[0]
     matches = list(test_dir.glob(f"{soundscape_id}.*"))
     if matches:
         return matches[0]
@@ -140,10 +163,24 @@ def main() -> None:
         [submission_columns.index(label) if label in submission_columns else -1 for label in labels],
         dtype=np.int32,
     )
-    output_probs = np.zeros((num_rows, len(submission_columns)), dtype=np.float32)
+    # Start from sample_submission defaults so local dry-run still outputs valid values
+    # even when competition test audio files are not exposed in draft sessions.
+    output_probs = submission.iloc[:, 1:].to_numpy(copy=True, dtype=np.float32)
+    soundscape_index = build_soundscape_index(test_soundscapes_dir)
+    missing_soundscapes = []
 
     for soundscape_id, items in tqdm(grouped_rows.items(), desc="soundscapes"):
-        soundscape_path = resolve_soundscape_path(test_soundscapes_dir, soundscape_id)
+        try:
+            soundscape_path = resolve_soundscape_path(
+                test_soundscapes_dir, soundscape_id, soundscape_index=soundscape_index
+            )
+        except FileNotFoundError as exc:
+            if args.strict_missing:
+                raise
+            missing_soundscapes.append(soundscape_id)
+            print(f"[WARN] {exc}. Keep sample_submission defaults for these rows.")
+            continue
+
         waveform = load_audio(soundscape_path, target_sr=TARGET_SAMPLE_RATE, mono=True)
 
         row_indices = [idx for idx, _ in items]
@@ -168,6 +205,11 @@ def main() -> None:
     submission.to_csv(args.output, index=False, float_format="%.6f")
 
     elapsed = time.time() - start_time
+    if missing_soundscapes:
+        print(
+            f"[WARN] Missing soundscape files: {len(missing_soundscapes)} groups "
+            f"(strict mode off)."
+        )
     print(f"Saved submission to {args.output} | rows={len(submission)} | time={elapsed:.1f}s")
 
 

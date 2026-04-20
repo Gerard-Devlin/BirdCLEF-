@@ -250,6 +250,15 @@ def build_checkpoint(
     labels,
     args: argparse.Namespace,
 ) -> dict:
+    def _to_serializable(value):
+        if isinstance(value, Path):
+            return str(value)
+        if isinstance(value, dict):
+            return {k: _to_serializable(v) for k, v in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [_to_serializable(v) for v in value]
+        return value
+
     scaler_state = None
     if scaler is not None:
         try:
@@ -268,7 +277,7 @@ def build_checkpoint(
         "labels": labels,
         "fold": args.fold,
         "best_val_auc": float(best_score),
-        "args": vars(args),
+        "args": _to_serializable(vars(args)),
         "saved_at_unix": time.time(),
     }
 
@@ -356,7 +365,6 @@ def main() -> None:
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=args.epochs, eta_min=args.learning_rate * 0.05
     )
-    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
     if hasattr(torch, "amp") and hasattr(torch.amp, "GradScaler"):
         scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
     else:  # pragma: no cover - compatibility fallback
@@ -374,7 +382,13 @@ def main() -> None:
         if not args.resume.exists():
             raise FileNotFoundError(f"Resume checkpoint not found: {args.resume}")
         print(f"Resuming from: {args.resume}")
-        resume_ckpt = torch.load(args.resume, map_location="cpu")
+        try:
+            # PyTorch >=2.6 defaults to weights_only=True, which can reject
+            # trusted training checkpoints that contain argparse/pathlib objects.
+            resume_ckpt = torch.load(args.resume, map_location="cpu", weights_only=False)
+        except TypeError:
+            # Backward compatibility for older PyTorch versions.
+            resume_ckpt = torch.load(args.resume, map_location="cpu")
 
         resume_labels = resume_ckpt.get("labels")
         if resume_labels is not None and list(resume_labels) != list(labels):
