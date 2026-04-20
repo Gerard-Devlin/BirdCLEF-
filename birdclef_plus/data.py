@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Dict, List
+import random
 
 import pandas as pd
 import torch
@@ -37,6 +38,8 @@ class BirdTrainDataset(Dataset):
         segment_seconds: float = 5.0,
         sample_rate: int = TARGET_SAMPLE_RATE,
         is_train: bool = True,
+        max_decode_retries: int = 3,
+        log_decode_errors: bool = True,
     ) -> None:
         self.df = dataframe.reset_index(drop=True)
         self.audio_dir = Path(audio_dir)
@@ -45,6 +48,8 @@ class BirdTrainDataset(Dataset):
         self.sample_rate = sample_rate
         self.is_train = is_train
         self.num_classes = len(label_to_idx)
+        self.max_decode_retries = max(1, int(max_decode_retries))
+        self.log_decode_errors = log_decode_errors
 
     def __len__(self) -> int:
         return len(self.df)
@@ -61,9 +66,41 @@ class BirdTrainDataset(Dataset):
         return target
 
     def __getitem__(self, index: int):
-        row = self.df.iloc[index]
-        audio_path = self.audio_dir / row["filename"]
-        waveform = load_audio(audio_path, target_sr=self.sample_rate, mono=True)
+        row_index = int(index)
+        row = self.df.iloc[row_index]
+        waveform = None
+        last_error = None
+        last_audio_path = None
+
+        for attempt in range(self.max_decode_retries):
+            row = self.df.iloc[row_index]
+            audio_path = self.audio_dir / row["filename"]
+            last_audio_path = audio_path
+            try:
+                waveform = load_audio(audio_path, target_sr=self.sample_rate, mono=True)
+                break
+            except Exception as exc:
+                last_error = exc
+                if self.is_train and attempt < self.max_decode_retries - 1:
+                    row_index = random.randint(0, len(self.df) - 1)
+                    continue
+                waveform = torch.zeros(self.segment_samples, dtype=torch.float32)
+                if self.log_decode_errors:
+                    print(
+                        f"[WARN] decode failed for {audio_path}: {exc}. Using silence fallback.",
+                        flush=True,
+                    )
+                break
+
+        if waveform is None:
+            # Safety fallback, should never be reached because we set silence above.
+            waveform = torch.zeros(self.segment_samples, dtype=torch.float32)
+            if self.log_decode_errors:
+                print(
+                    f"[WARN] decode fallback triggered for {last_audio_path}: {last_error}",
+                    flush=True,
+                )
+
         waveform = crop_or_pad(
             waveform, num_samples=self.segment_samples, random_crop=self.is_train
         )

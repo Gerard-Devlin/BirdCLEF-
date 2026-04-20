@@ -111,17 +111,20 @@ def load_audio(path: Path, target_sr: int = TARGET_SAMPLE_RATE, mono: bool = Tru
 
     waveform = None
     sample_rate = None
+    backend_errors = []
 
     if torchaudio is not None:
         try:
             waveform, sample_rate = _load_with_torchaudio(path)
-        except Exception:
+        except Exception as exc:
+            backend_errors.append(f"torchaudio: {exc}")
             waveform, sample_rate = None, None
 
     if waveform is None and sf is not None:
         try:
             waveform, sample_rate = _load_with_soundfile(path)
-        except Exception:
+        except Exception as exc:
+            backend_errors.append(f"soundfile: {exc}")
             waveform, sample_rate = None, None
 
     if waveform is not None and sample_rate is not None:
@@ -131,12 +134,14 @@ def load_audio(path: Path, target_sr: int = TARGET_SAMPLE_RATE, mono: bool = Tru
         return waveform
 
     if librosa is not None:
-        waveform, _ = librosa.load(str(path), sr=target_sr, mono=mono)
-        return torch.tensor(waveform, dtype=torch.float32)
+        try:
+            waveform, _ = librosa.load(str(path), sr=target_sr, mono=mono)
+            return torch.tensor(waveform, dtype=torch.float32)
+        except Exception as exc:
+            backend_errors.append(f"librosa: {exc}")
 
-    raise RuntimeError(
-        "No audio backend available. Install torchaudio (recommended) or librosa."
-    )
+    details = " | ".join(backend_errors) if backend_errors else "no decoder backend found"
+    raise RuntimeError(f"Failed to decode audio: {path} ({details})")
 
 
 def crop_or_pad(waveform: torch.Tensor, num_samples: int, random_crop: bool = False) -> torch.Tensor:
