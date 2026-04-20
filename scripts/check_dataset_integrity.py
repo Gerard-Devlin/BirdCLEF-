@@ -10,6 +10,12 @@ try:
 except ImportError as exc:  # pragma: no cover
     raise ImportError("Please install soundfile: python -m pip install soundfile") from exc
 
+try:
+    from tqdm.auto import tqdm
+except ImportError:  # pragma: no cover
+    def tqdm(iterable, **_kwargs):
+        return iterable
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Check BirdCLEF dataset file integrity")
@@ -20,6 +26,11 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=0,
         help="0 means check all files; otherwise check first N rows from train.csv",
+    )
+    parser.add_argument(
+        "--no-progress",
+        action="store_true",
+        help="Disable progress bar output.",
     )
     return parser.parse_args()
 
@@ -39,7 +50,15 @@ def main() -> None:
     decode_fail = []
     ext_counter = Counter()
 
-    for row in rows:
+    iterator = tqdm(
+        rows,
+        total=len(rows),
+        desc="Checking audio files",
+        dynamic_ncols=True,
+        disable=args.no_progress,
+    )
+
+    for row in iterator:
         rel = row["filename"]
         path = args.audio_dir / rel
         ext_counter[path.suffix.lower()] += 1

@@ -29,6 +29,41 @@ python scripts/train_baseline.py \
   --amp
 ```
 
+Long-running training options:
+- `--save-every-steps 200`: save rolling step checkpoint to `step_last_foldX.pth` every 200 optimizer steps
+- `--resume <path>`: resume from `last_foldX.pth` or `step_last_foldX.pth`
+
+Example with periodic checkpointing:
+```bash
+python scripts/train_baseline.py \
+  --train-csv dataset/train.csv \
+  --audio-dir dataset/train_audio \
+  --output-dir outputs/fold0 \
+  --folds 5 \
+  --fold 0 \
+  --epochs 12 \
+  --batch-size 32 \
+  --num-workers 4 \
+  --amp \
+  --save-every-steps 200
+```
+
+Resume example:
+```bash
+python scripts/train_baseline.py \
+  --train-csv dataset/train.csv \
+  --audio-dir dataset/train_audio \
+  --output-dir outputs/fold0 \
+  --folds 5 \
+  --fold 0 \
+  --epochs 12 \
+  --batch-size 32 \
+  --num-workers 4 \
+  --amp \
+  --save-every-steps 200 \
+  --resume outputs/fold0/last_fold0.pth
+```
+
 Run multiple folds (example):
 ```bash
 for FOLD in 0 1 2 3 4; do

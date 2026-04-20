@@ -4,7 +4,7 @@ import argparse
 import json
 import time
 from pathlib import Path
-from typing import Tuple
+from typing import Callable, Optional, Tuple
 import sys
 
 import numpy as np
@@ -47,6 +47,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mixup-alpha", type=float, default=0.2)
     parser.add_argument("--dropout", type=float, default=0.3)
     parser.add_argument("--amp", action="store_true")
+    parser.add_argument(
+        "--save-every-steps",
+        type=int,
+        default=0,
+        help="Save rolling step checkpoint every N optimizer steps. 0 disables it.",
+    )
+    parser.add_argument(
+        "--resume",
+        type=Path,
+        default=None,
+        help="Path to checkpoint (.pth) to resume training from.",
+    )
+    parser.add_argument(
+        "--no-save-on-interrupt",
+        action="store_true",
+        help="Disable automatic interrupt checkpoint on Ctrl+C or termination.",
+    )
     return parser.parse_args()
 
 
@@ -102,10 +119,15 @@ def train_one_epoch(
     scaler,
     use_amp: bool,
     mixup_alpha: float,
-) -> float:
+    global_step_start: int = 0,
+    save_every_steps: int = 0,
+    on_step_checkpoint: Optional[Callable[[int], None]] = None,
+) -> Tuple[float, int]:
     model.train()
     frontend.train()
     running_loss = 0.0
+    seen_samples = 0
+    global_step = int(global_step_start)
 
     progress = tqdm(loader, desc="train", leave=False)
     skipped_batches = 0
@@ -132,13 +154,22 @@ def train_one_epoch(
         scaler.step(optimizer)
         scaler.update()
 
+        global_step += 1
         running_loss += float(loss.item()) * waveforms.size(0)
+        seen_samples += int(waveforms.size(0))
         progress.set_postfix(loss=f"{loss.item():.4f}")
+
+        if (
+            save_every_steps > 0
+            and on_step_checkpoint is not None
+            and global_step % save_every_steps == 0
+        ):
+            on_step_checkpoint(global_step)
 
     if skipped_batches > 0:
         print(f"[WARN] Skipped {skipped_batches} non-finite batches in this epoch.", flush=True)
 
-    return running_loss / max(1, len(loader.dataset))
+    return running_loss / max(1, seen_samples), global_step
 
 
 @torch.no_grad()
@@ -178,6 +209,49 @@ def validate_one_epoch(
     score = macro_auc_skip_empty(y_true, y_pred)
     val_loss = running_loss / len(loader.dataset)
     return val_loss, score, y_true, y_pred
+
+
+def build_checkpoint(
+    *,
+    epoch: int,
+    global_step: int,
+    best_score: float,
+    model: nn.Module,
+    frontend: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    scheduler,
+    scaler,
+    labels,
+    args: argparse.Namespace,
+) -> dict:
+    scaler_state = None
+    if scaler is not None:
+        try:
+            scaler_state = scaler.state_dict()
+        except Exception:
+            scaler_state = None
+
+    return {
+        "epoch": epoch,
+        "global_step": global_step,
+        "model_state_dict": model.state_dict(),
+        "frontend_state_dict": frontend.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "scheduler_state_dict": scheduler.state_dict(),
+        "scaler_state_dict": scaler_state,
+        "labels": labels,
+        "fold": args.fold,
+        "best_val_auc": float(best_score),
+        "args": vars(args),
+        "saved_at_unix": time.time(),
+    }
+
+
+def atomic_torch_save(obj: dict, path: Path) -> None:
+    path = Path(path)
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    torch.save(obj, tmp_path)
+    tmp_path.replace(path)
 
 
 def main() -> None:
@@ -247,66 +321,164 @@ def main() -> None:
     )
     scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
     if hasattr(torch, "amp") and hasattr(torch.amp, "GradScaler"):
-        scaler = torch.amp.GradScaler(device="cuda", enabled=use_amp)
+        scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
     else:  # pragma: no cover - compatibility fallback
         scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
 
     best_score = -1.0
+    start_epoch = 1
+    global_step = 0
     best_path = args.output_dir / f"best_fold{args.fold}.pth"
     last_path = args.output_dir / f"last_fold{args.fold}.pth"
+    step_path = args.output_dir / f"step_last_fold{args.fold}.pth"
+    interrupt_path = args.output_dir / f"interrupt_fold{args.fold}.pth"
 
-    train_start = time.time()
-    for epoch in range(1, args.epochs + 1):
-        epoch_start = time.time()
-        train_loss = train_one_epoch(
-            model=model,
-            frontend=frontend,
-            loader=train_loader,
-            optimizer=optimizer,
-            criterion=criterion,
-            device=device,
-            scaler=scaler,
-            use_amp=use_amp,
-            mixup_alpha=args.mixup_alpha,
-        )
-        val_loss, val_score, y_true, y_pred = validate_one_epoch(
-            model=model,
-            frontend=frontend,
-            loader=valid_loader,
-            criterion=criterion,
-            device=device,
-            use_amp=use_amp,
-        )
-        scheduler.step()
+    if args.resume is not None:
+        if not args.resume.exists():
+            raise FileNotFoundError(f"Resume checkpoint not found: {args.resume}")
+        print(f"Resuming from: {args.resume}")
+        resume_ckpt = torch.load(args.resume, map_location="cpu")
 
-        checkpoint = {
-            "epoch": epoch,
-            "model_state_dict": model.state_dict(),
-            "frontend_state_dict": frontend.state_dict(),
-            "labels": labels,
-            "fold": args.fold,
-            "best_val_auc": best_score,
-            "args": vars(args),
-        }
-        torch.save(checkpoint, last_path)
-
-        if val_score > best_score:
-            best_score = val_score
-            checkpoint["best_val_auc"] = best_score
-            torch.save(checkpoint, best_path)
-            np.savez_compressed(
-                args.output_dir / f"oof_fold{args.fold}.npz",
-                y_true=y_true,
-                y_pred=y_pred,
+        resume_labels = resume_ckpt.get("labels")
+        if resume_labels is not None and list(resume_labels) != list(labels):
+            raise ValueError(
+                "Label mapping mismatch between resume checkpoint and current dataset."
             )
 
-        elapsed = time.time() - epoch_start
+        model.load_state_dict(resume_ckpt["model_state_dict"], strict=True)
+        if "frontend_state_dict" in resume_ckpt:
+            frontend.load_state_dict(resume_ckpt["frontend_state_dict"], strict=False)
+        if "optimizer_state_dict" in resume_ckpt:
+            optimizer.load_state_dict(resume_ckpt["optimizer_state_dict"])
+        if "scheduler_state_dict" in resume_ckpt:
+            scheduler.load_state_dict(resume_ckpt["scheduler_state_dict"])
+        scaler_state = resume_ckpt.get("scaler_state_dict")
+        if scaler_state:
+            try:
+                scaler.load_state_dict(scaler_state)
+            except Exception as exc:
+                print(f"[WARN] Failed to load scaler state: {exc}")
+
+        best_score = float(resume_ckpt.get("best_val_auc", best_score))
+        start_epoch = int(resume_ckpt.get("epoch", 0)) + 1
+        global_step = int(resume_ckpt.get("global_step", 0))
         print(
-            f"Epoch {epoch:02d}/{args.epochs} | "
-            f"train_loss={train_loss:.4f} | val_loss={val_loss:.4f} | "
-            f"val_auc={val_score:.5f} | best_auc={best_score:.5f} | "
-            f"epoch_time={elapsed:.1f}s"
+            f"Resume state -> start_epoch={start_epoch}, global_step={global_step}, best_auc={best_score:.5f}"
         )
+
+    if start_epoch > args.epochs:
+        print(
+            f"Nothing to train: start_epoch={start_epoch} is greater than --epochs={args.epochs}."
+        )
+        return
+
+    train_start = time.time()
+    current_epoch = start_epoch - 1
+    try:
+        for epoch in range(start_epoch, args.epochs + 1):
+            current_epoch = epoch
+            epoch_start = time.time()
+
+            def on_step_checkpoint(step_value: int) -> None:
+                checkpoint = build_checkpoint(
+                    epoch=epoch,
+                    global_step=step_value,
+                    best_score=best_score,
+                    model=model,
+                    frontend=frontend,
+                    optimizer=optimizer,
+                    scheduler=scheduler,
+                    scaler=scaler,
+                    labels=labels,
+                    args=args,
+                )
+                atomic_torch_save(checkpoint, step_path)
+
+            train_loss, global_step = train_one_epoch(
+                model=model,
+                frontend=frontend,
+                loader=train_loader,
+                optimizer=optimizer,
+                criterion=criterion,
+                device=device,
+                scaler=scaler,
+                use_amp=use_amp,
+                mixup_alpha=args.mixup_alpha,
+                global_step_start=global_step,
+                save_every_steps=args.save_every_steps,
+                on_step_checkpoint=on_step_checkpoint,
+            )
+            val_loss, val_score, y_true, y_pred = validate_one_epoch(
+                model=model,
+                frontend=frontend,
+                loader=valid_loader,
+                criterion=criterion,
+                device=device,
+                use_amp=use_amp,
+            )
+            scheduler.step()
+
+            if val_score > best_score:
+                best_score = val_score
+                best_checkpoint = build_checkpoint(
+                    epoch=epoch,
+                    global_step=global_step,
+                    best_score=best_score,
+                    model=model,
+                    frontend=frontend,
+                    optimizer=optimizer,
+                    scheduler=scheduler,
+                    scaler=scaler,
+                    labels=labels,
+                    args=args,
+                )
+                atomic_torch_save(best_checkpoint, best_path)
+                np.savez_compressed(
+                    args.output_dir / f"oof_fold{args.fold}.npz",
+                    y_true=y_true,
+                    y_pred=y_pred,
+                )
+
+            last_checkpoint = build_checkpoint(
+                epoch=epoch,
+                global_step=global_step,
+                best_score=best_score,
+                model=model,
+                frontend=frontend,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                scaler=scaler,
+                labels=labels,
+                args=args,
+            )
+            atomic_torch_save(last_checkpoint, last_path)
+
+            elapsed = time.time() - epoch_start
+            print(
+                f"Epoch {epoch:02d}/{args.epochs} | "
+                f"step={global_step} | "
+                f"train_loss={train_loss:.4f} | val_loss={val_loss:.4f} | "
+                f"val_auc={val_score:.5f} | best_auc={best_score:.5f} | "
+                f"epoch_time={elapsed:.1f}s"
+            )
+    except (KeyboardInterrupt, SystemExit):
+        if not args.no_save_on_interrupt:
+            print("\n[WARN] Training interrupted, saving interrupt checkpoint...", flush=True)
+            interrupt_checkpoint = build_checkpoint(
+                epoch=current_epoch,
+                global_step=global_step,
+                best_score=best_score,
+                model=model,
+                frontend=frontend,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                scaler=scaler,
+                labels=labels,
+                args=args,
+            )
+            atomic_torch_save(interrupt_checkpoint, interrupt_path)
+            print(f"[WARN] Interrupt checkpoint saved: {interrupt_path}", flush=True)
+        raise
 
     total_minutes = (time.time() - train_start) / 60.0
     print(f"Training done. best_auc={best_score:.5f} | total_time={total_minutes:.1f} min")
