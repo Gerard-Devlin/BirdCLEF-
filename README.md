@@ -1,4 +1,4 @@
-# BirdCLEF+ 2026
+﻿# BirdCLEF+ 2026
 > Acoustic Species Identification in the Pantanal, South America
 
 ## Practical Workflow (Server -> Kaggle)
@@ -98,7 +98,15 @@ This creates:
 - `build/kaggle_bundle_fold0/birdclef_plus/*`
 
 ### 3) Upload Bundle As A Kaggle Dataset
-You can upload via Kaggle web UI, or with CLI:
+For Kaggle web upload (single archive file), first create a tarball:
+```bash
+cd build
+tar -czf kaggle_bundle_fold0.tar.gz kaggle_bundle_fold0
+```
+
+Then upload `build/kaggle_bundle_fold0.tar.gz` in the Kaggle Dataset web UI.
+
+Or upload with Kaggle CLI (directory upload):
 ```bash
 kaggle datasets init -p build/kaggle_bundle_fold0
 # edit build/kaggle_bundle_fold0/dataset-metadata.json
@@ -155,11 +163,11 @@ python scripts/check_dataset_integrity.py \
 The goal of this competition is to develop machine learning frameworks capable of identifying understudied species within continuous audio data from Brazil's Pantanal wetlands. Successful solutions will help advance biodiversity monitoring in the last wild places on Earth.
 
 ## Description
-How do you protect an ecosystem you can’t fully see? One way is to listen.
+How do you protect an ecosystem you can鈥檛 fully see? One way is to listen.
 
-This competition involves building models that automatically identify wildlife species from their vocalizations in audio recordings collected across the Pantanal wetlands. This work will support more reliable biodiversity monitoring in one of the world’s most diverse and threatened ecosystems.
+This competition involves building models that automatically identify wildlife species from their vocalizations in audio recordings collected across the Pantanal wetlands. This work will support more reliable biodiversity monitoring in one of the world鈥檚 most diverse and threatened ecosystems.
 
-Understanding how ecological communities respond to environmental change and restoration efforts is a central challenge in conservation science. The Pantanal — a wetland spanning 150,000+ km² across Brazil and neighboring countries — is home to over 650 bird species plus countless other animals, yet much of it remains unmonitored. Seasonal flooding, wildfires, agricultural expansion, and climate change make regular fieldwork challenging.
+Understanding how ecological communities respond to environmental change and restoration efforts is a central challenge in conservation science. The Pantanal 鈥?a wetland spanning 150,000+ km虏 across Brazil and neighboring countries 鈥?is home to over 650 bird species plus countless other animals, yet much of it remains unmonitored. Seasonal flooding, wildfires, agricultural expansion, and climate change make regular fieldwork challenging.
 
 Photo of a jaguar with its mouth open.
 
@@ -244,7 +252,7 @@ b) Originality and novelty
 
 3 points: One step ahead of the pack
 
-2 points: Yet another paper about…
+2 points: Yet another paper about鈥?
 
 1 point: It's been said many times before
 
@@ -285,17 +293,17 @@ iNaturalist: Grant van Horn
 
 Instituto Homem Pantaneiro: Wener Hugo Arruda Moreno
 
-Instituto Nacional de Pesquisa do Pantanal (INPP): Carolline Zatta Fieker, Karl-L. Schuchmann, Kirk Thiago Pedroso Azevedo, Lucas Korzune Sampaio Teles, Marinez Isaac Marques and Matheus Gonçalves dos Reis
+Instituto Nacional de Pesquisa do Pantanal (INPP): Carolline Zatta Fieker, Karl-L. Schuchmann, Kirk Thiago Pedroso Azevedo, Lucas Korzune Sampaio Teles, Marinez Isaac Marques and Matheus Gon莽alves dos Reis
 
 K. Lisa Yang Center for Conservation Bioacoustics: Stefan Kahl, Larissa Sugai and Holger Klinck
 
-LifeCLEF: Alexis Joly and Henning Müller
+LifeCLEF: Alexis Joly and Henning M眉ller
 
-Sauá Consultoria Ambiental: Carolina Martins Garcia
+Sau谩 Consultoria Ambiental: Carolina Martins Garcia
 
-Universidade Federal de Mato Grosso do Sul (UFMS): Alyson Vieira de Melo, Daiene Louveira Hokama Sousa, José Luiz Massao Moreira Sugai, João Emílio de Almeida Júnior, Liliana Piatti, Mariana Motti Barbosa, Matheus de Oliveira Neves, Priscila do Nascimento Lopes and Ryan Christopher Kridler
+Universidade Federal de Mato Grosso do Sul (UFMS): Alyson Vieira de Melo, Daiene Louveira Hokama Sousa, Jos茅 Luiz Massao Moreira Sugai, Jo茫o Em铆lio de Almeida J煤nior, Liliana Piatti, Mariana Motti Barbosa, Matheus de Oliveira Neves, Priscila do Nascimento Lopes and Ryan Christopher Kridler
 
-Xeno-canto: Willem-Pier Vellinga, Bob Planqué
+Xeno-canto: Willem-Pier Vellinga, Bob Planqu茅
 
 Photo Credits
 
@@ -303,5 +311,5 @@ Banner picture of a Hyacinth Macaw by Thomas Fuhrmann. Inset picture of a Jaguar
 
 ## Citation
 Stefan Kahl, Tom Denton, Larissa Sugai, Liliana Piatti, Ryan Holbrook, Holger Klinck, and Ashley Oldacre. BirdCLEF+ 2026. [https://kaggle.com/competitions/birdclef-2026](https://kaggle.com/competitions/birdclef-2026), 2026. Kaggle. 
-#   B i r d C L E F -  
- 
+
+

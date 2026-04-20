@@ -111,7 +111,13 @@ def main() -> None:
     submission_columns = submission.columns.tolist()[1:]
     num_rows = len(submission)
 
-    checkpoint = torch.load(args.checkpoint, map_location="cpu")
+    try:
+        # PyTorch >=2.6 defaults to weights_only=True and may reject extra python objects
+        # (for example pathlib.PosixPath) stored in training args. This checkpoint is trusted.
+        checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
+    except TypeError:
+        # Backward compatibility for older PyTorch versions without weights_only argument.
+        checkpoint = torch.load(args.checkpoint, map_location="cpu")
     labels: List[str] = checkpoint["labels"]
     model = BirdCLEFNet(num_classes=len(labels))
     model.load_state_dict(checkpoint["model_state_dict"], strict=True)
