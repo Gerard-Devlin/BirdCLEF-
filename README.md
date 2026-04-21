@@ -233,6 +233,22 @@ print("competition_dir:", competition_dir)
 !PYTHONNOUSERSITE=1 python {bundle_dir}/scripts/infer_kaggle.py \
   --checkpoint {bundle_dir}/checkpoint.pth \
   --competition-dir {competition_dir} \
+  --postprocess-topn 1 \
+  --output /kaggle/working/submission.csv
+```
+
+If you have multiple fold checkpoints in your bundle, you can ensemble directly:
+
+```python
+!PYTHONNOUSERSITE=1 python {bundle_dir}/scripts/infer_kaggle.py \
+  --checkpoint \
+    {bundle_dir}/fold0_best.pth \
+    {bundle_dir}/fold1_best.pth \
+    {bundle_dir}/fold2_best.pth \
+    {bundle_dir}/fold3_best.pth \
+    {bundle_dir}/fold4_best.pth \
+  --competition-dir {competition_dir} \
+  --postprocess-topn 1 \
   --output /kaggle/working/submission.csv
 ```
 
@@ -248,6 +264,7 @@ display(sub.head(3))
 Then click `Save Version` + `Submit to Competition`.
 
 Tip: in draft sessions Kaggle may not expose real test soundscape files. Use `--strict-missing` only for final verification runs.
+`--postprocess-topn 1` is enabled by default and usually improves leaderboard alignment on soundscapes.
 
 ### 5) Notes For Code Competition Constraints
 

@@ -369,6 +369,7 @@ def build_checkpoint(
     scaler,
     labels,
     args: argparse.Namespace,
+    best_metric_name: str,
 ) -> dict:
     def _to_serializable(value):
         if isinstance(value, Path):
@@ -397,6 +398,7 @@ def build_checkpoint(
         "labels": labels,
         "fold": args.fold,
         "best_val_auc": float(best_score),
+        "best_metric_name": str(best_metric_name),
         "args": _to_serializable(vars(args)),
         "saved_at_unix": time.time(),
     }
@@ -575,12 +577,14 @@ def main() -> None:
             pin_memory=True,
             drop_last=False,
         )
-    if args.select_best_on == "soundscape" and valid_soundscape_loader is None:
+    selected_best_metric = args.select_best_on
+    if selected_best_metric == "soundscape" and valid_soundscape_loader is None:
         print(
             "[WARN] --select-best-on soundscape requested but no soundscape validation data. "
             "Falling back to combined validation metric.",
             flush=True,
         )
+        selected_best_metric = "all"
 
     frontend = MelSpectrogramFrontend(augment=True).to(device)
     model = BirdCLEFNet(num_classes=len(labels), dropout=args.dropout).to(device)
@@ -626,7 +630,16 @@ def main() -> None:
         if "frontend_state_dict" in resume_ckpt:
             frontend.load_state_dict(resume_ckpt["frontend_state_dict"], strict=False)
 
-        best_score = float(resume_ckpt.get("best_val_auc", best_score))
+        resume_best_metric_name = str(resume_ckpt.get("best_metric_name", "all"))
+        if resume_best_metric_name != selected_best_metric:
+            print(
+                f"[WARN] Resume checkpoint best metric is '{resume_best_metric_name}', "
+                f"but current run uses '{selected_best_metric}'. Resetting best score tracker.",
+                flush=True,
+            )
+            best_score = -1.0
+        else:
+            best_score = float(resume_ckpt.get("best_val_auc", best_score))
         start_epoch = int(resume_ckpt.get("epoch", 0)) + 1
         global_step = int(resume_ckpt.get("global_step", 0))
         if args.resume_model_only:
@@ -681,6 +694,7 @@ def main() -> None:
                     scaler=scaler,
                     labels=labels,
                     args=args,
+                    best_metric_name=selected_best_metric,
                 )
                 atomic_torch_save(checkpoint, step_path)
 
@@ -751,7 +765,7 @@ def main() -> None:
             selected_score = val_score
             selected_y_true = y_true
             selected_y_pred = y_pred
-            if args.select_best_on == "soundscape" and val_soundscape_score is not None:
+            if selected_best_metric == "soundscape" and val_soundscape_score is not None:
                 selected_metric_name = "soundscape"
                 selected_score = float(val_soundscape_score)
                 selected_y_true = y_true_soundscape
@@ -771,6 +785,7 @@ def main() -> None:
                     scaler=scaler,
                     labels=labels,
                     args=args,
+                    best_metric_name=selected_best_metric,
                 )
                 atomic_torch_save(best_checkpoint, best_path)
                 np.savez_compressed(
@@ -790,6 +805,7 @@ def main() -> None:
                 scaler=scaler,
                 labels=labels,
                 args=args,
+                best_metric_name=selected_best_metric,
             )
             atomic_torch_save(last_checkpoint, last_path)
 
@@ -824,13 +840,14 @@ def main() -> None:
                 scaler=scaler,
                 labels=labels,
                 args=args,
+                best_metric_name=selected_best_metric,
             )
             atomic_torch_save(interrupt_checkpoint, interrupt_path)
             print(f"[WARN] Interrupt checkpoint saved: {interrupt_path}", flush=True)
         raise
 
     total_minutes = (time.time() - train_start) / 60.0
-    metric_name = args.select_best_on
+    metric_name = selected_best_metric
     print(
         f"Training done. best_{metric_name}_auc={best_score:.5f} | total_time={total_minutes:.1f} min"
     )

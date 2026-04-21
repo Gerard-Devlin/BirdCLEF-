@@ -22,7 +22,13 @@ from birdclef_plus.audio import TARGET_SAMPLE_RATE, crop_or_pad, load_audio
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="BirdCLEF+ 2026 Kaggle inference")
-    parser.add_argument("--checkpoint", type=Path, required=True)
+    parser.add_argument(
+        "--checkpoint",
+        type=Path,
+        nargs="+",
+        required=True,
+        help="One or more checkpoints. If multiple are provided, predictions are ensembled by averaging.",
+    )
     parser.add_argument(
         "--competition-dir",
         type=Path,
@@ -32,6 +38,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--segment-seconds", type=float, default=5.0)
     parser.add_argument("--tta-flip", action="store_true", help="Average with time-flip TTA")
+    parser.add_argument(
+        "--postprocess-topn",
+        type=int,
+        default=1,
+        help=(
+            "Apply soundscape-level TopN postprocessing. "
+            "0 disables it; 1 means multiply each segment/class probability by per-file max "
+            "probability for that class."
+        ),
+    )
     parser.add_argument("--output", type=Path, default=Path("submission.csv"))
     parser.add_argument(
         "--strict-missing",
@@ -132,6 +148,20 @@ def predict_file(
     return np.concatenate(all_probs, axis=0)
 
 
+def apply_topn_postprocess(probs: np.ndarray, topn: int) -> np.ndarray:
+    if topn <= 0:
+        return probs
+    if probs.ndim != 2 or probs.shape[0] == 0:
+        return probs
+
+    n_segments = probs.shape[0]
+    topn = max(1, min(int(topn), n_segments))
+    sorted_desc = np.sort(probs, axis=0)[::-1]
+    topn_mean = sorted_desc[:topn].mean(axis=0, keepdims=True)
+    out = probs * topn_mean
+    return np.clip(out, 0.0, 1.0)
+
+
 def main() -> None:
     args = parse_args()
     start_time = time.time()
@@ -147,40 +177,51 @@ def main() -> None:
     submission_columns = submission.columns.tolist()[1:]
     num_rows = len(submission)
 
-    try:
-        # PyTorch >=2.6 defaults to weights_only=True and may reject extra python objects
-        # (for example pathlib.PosixPath) stored in training args. This checkpoint is trusted.
-        checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
-    except TypeError:
-        # Backward compatibility for older PyTorch versions without weights_only argument.
-        checkpoint = torch.load(args.checkpoint, map_location="cpu")
-    labels: List[str] = checkpoint["labels"]
-    model = BirdCLEFNet(num_classes=len(labels))
-    model.load_state_dict(checkpoint["model_state_dict"], strict=True)
-    frontend = MelSpectrogramFrontend(augment=False)
-    if "frontend_state_dict" in checkpoint:
-        frontend.load_state_dict(checkpoint["frontend_state_dict"], strict=False)
-
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = model.to(device).eval()
-    frontend = frontend.to(device).eval()
-    print(f"Loaded checkpoint: {args.checkpoint}")
     print(f"Device: {device}")
+
+    model_entries = []
+    for ckpt_path in args.checkpoint:
+        try:
+            # PyTorch >=2.6 defaults to weights_only=True and may reject extra python objects
+            # (for example pathlib.PosixPath) stored in training args. This checkpoint is trusted.
+            checkpoint = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+        except TypeError:
+            # Backward compatibility for older PyTorch versions without weights_only argument.
+            checkpoint = torch.load(ckpt_path, map_location="cpu")
+
+        labels: List[str] = checkpoint["labels"]
+        model = BirdCLEFNet(num_classes=len(labels))
+        model.load_state_dict(checkpoint["model_state_dict"], strict=True)
+        frontend = MelSpectrogramFrontend(augment=False)
+        if "frontend_state_dict" in checkpoint:
+            frontend.load_state_dict(checkpoint["frontend_state_dict"], strict=False)
+
+        model = model.to(device).eval()
+        frontend = frontend.to(device).eval()
+        model_to_submission = np.array(
+            [submission_columns.index(label) if label in submission_columns else -1 for label in labels],
+            dtype=np.int32,
+        )
+        covered_labels = int((model_to_submission >= 0).sum())
+        print(
+            f"Loaded checkpoint: {ckpt_path} | labels={len(labels)} | "
+            f"matched_submission_labels={covered_labels}/{len(submission_columns)}"
+        )
+        model_entries.append(
+            {
+                "model": model,
+                "frontend": frontend,
+                "map": model_to_submission,
+            }
+        )
+    print(f"Ensemble size: {len(model_entries)}")
 
     grouped_rows: Dict[str, List[Tuple[int, int]]] = defaultdict(list)
     for row_index, row_id in enumerate(submission["row_id"].astype(str).tolist()):
         soundscape_id, end_second = parse_row_id(row_id)
         grouped_rows[soundscape_id].append((row_index, end_second))
 
-    model_to_submission = np.array(
-        [submission_columns.index(label) if label in submission_columns else -1 for label in labels],
-        dtype=np.int32,
-    )
-    covered_labels = int((model_to_submission >= 0).sum())
-    print(
-        f"Label coverage: model={len(labels)} | submission={len(submission_columns)} | "
-        f"matched={covered_labels} | unmatched_in_submission={len(submission_columns) - covered_labels}"
-    )
     # Start from sample_submission defaults so local dry-run still outputs valid values
     # even when competition test audio files are not exposed in draft sessions.
     output_probs = submission.iloc[:, 1:].to_numpy(copy=True, dtype=np.float32)
@@ -205,22 +246,39 @@ def main() -> None:
 
         row_indices = [idx for idx, _ in items]
         end_seconds = [sec for _, sec in items]
-        probs = predict_file(
-            model=model,
-            frontend=frontend,
-            waveform=waveform,
-            end_seconds=end_seconds,
-            batch_size=args.batch_size,
-            segment_seconds=args.segment_seconds,
-            tta_flip=args.tta_flip,
-            device=device,
-        )
+        row_count = len(row_indices)
+        num_classes = len(submission_columns)
+        sum_probs = np.zeros((row_count, num_classes), dtype=np.float32)
+        count_probs = np.zeros((row_count, num_classes), dtype=np.float32)
 
-        for local_idx, row_idx in enumerate(row_indices):
-            row_prob = probs[local_idx]
+        for entry in model_entries:
+            probs = predict_file(
+                model=entry["model"],
+                frontend=entry["frontend"],
+                waveform=waveform,
+                end_seconds=end_seconds,
+                batch_size=args.batch_size,
+                segment_seconds=args.segment_seconds,
+                tta_flip=args.tta_flip,
+                device=device,
+            )
+            model_to_submission = entry["map"]
             valid_mask = model_to_submission >= 0
-            output_probs[row_idx, model_to_submission[valid_mask]] = row_prob[valid_mask]
-            updated_rows += 1
+            if not np.any(valid_mask):
+                continue
+            dst_indices = model_to_submission[valid_mask]
+            sum_probs[:, dst_indices] += probs[:, valid_mask]
+            count_probs[:, dst_indices] += 1.0
+
+        class_mask = count_probs[0] > 0
+        row_output = output_probs[row_indices].copy()
+        row_output[:, class_mask] = sum_probs[:, class_mask] / count_probs[:, class_mask]
+        if args.postprocess_topn > 0 and np.any(class_mask):
+            row_output[:, class_mask] = apply_topn_postprocess(
+                row_output[:, class_mask], topn=args.postprocess_topn
+            )
+        output_probs[row_indices] = row_output
+        updated_rows += row_count
 
     submission.iloc[:, 1:] = output_probs
     submission.to_csv(args.output, index=False, float_format="%.6f")
