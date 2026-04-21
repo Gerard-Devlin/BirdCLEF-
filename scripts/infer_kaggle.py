@@ -189,6 +189,42 @@ def apply_topn_postprocess(probs: np.ndarray, topn: int) -> np.ndarray:
     return np.clip(out, 0.0, 1.0)
 
 
+def adapt_state_dict_prefix_for_model(
+    model: torch.nn.Module, checkpoint_state_dict: Dict[str, torch.Tensor]
+) -> Tuple[Dict[str, torch.Tensor], Optional[str]]:
+    model_keys = list(model.state_dict().keys())
+    ckpt_keys = list(checkpoint_state_dict.keys())
+
+    model_has_backbone_prefix = any(key.startswith("backbone.") for key in model_keys)
+    ckpt_has_backbone_prefix = any(key.startswith("backbone.") for key in ckpt_keys)
+
+    if model_has_backbone_prefix and not ckpt_has_backbone_prefix:
+        adapted = {}
+        for key, value in checkpoint_state_dict.items():
+            if key.startswith("backbone."):
+                adapted[key] = value
+            else:
+                adapted[f"backbone.{key}"] = value
+        return (
+            adapted,
+            "[INFO] Adapted checkpoint state_dict from legacy key format to 'backbone.*' format.",
+        )
+
+    if (not model_has_backbone_prefix) and ckpt_has_backbone_prefix:
+        adapted = {}
+        for key, value in checkpoint_state_dict.items():
+            if key.startswith("backbone."):
+                adapted[key[len("backbone.") :]] = value
+            else:
+                adapted[key] = value
+        return (
+            adapted,
+            "[INFO] Adapted checkpoint state_dict from 'backbone.*' format to legacy key format.",
+        )
+
+    return checkpoint_state_dict, None
+
+
 def main() -> None:
     args = parse_args()
     start_time = time.time()
@@ -237,7 +273,21 @@ def main() -> None:
             dropout=dropout,
             model_name=model_name,
         )
-        model.load_state_dict(checkpoint["model_state_dict"], strict=True)
+        model_state_dict = checkpoint["model_state_dict"]
+        try:
+            model.load_state_dict(model_state_dict, strict=True)
+        except RuntimeError as exc:
+            adapted_state_dict, adaptation_msg = adapt_state_dict_prefix_for_model(
+                model, model_state_dict
+            )
+            if adaptation_msg is not None:
+                print(adaptation_msg)
+                model.load_state_dict(adapted_state_dict, strict=True)
+            else:
+                raise RuntimeError(
+                    f"Failed to load checkpoint '{ckpt_path}' for model '{model_name}'. "
+                    "This usually means architecture mismatch (for example custom_cnn vs efficientnet)."
+                ) from exc
         frontend = MelSpectrogramFrontend(augment=False)
         if "frontend_state_dict" in checkpoint:
             frontend.load_state_dict(checkpoint["frontend_state_dict"], strict=False)

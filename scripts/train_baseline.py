@@ -369,6 +369,42 @@ def count_non_finite_params(module: nn.Module) -> int:
     return total_bad
 
 
+def adapt_state_dict_prefix_for_model(
+    model: nn.Module, checkpoint_state_dict: dict
+) -> Tuple[dict, Optional[str]]:
+    model_keys = list(model.state_dict().keys())
+    ckpt_keys = list(checkpoint_state_dict.keys())
+
+    model_has_backbone_prefix = any(key.startswith("backbone.") for key in model_keys)
+    ckpt_has_backbone_prefix = any(key.startswith("backbone.") for key in ckpt_keys)
+
+    if model_has_backbone_prefix and not ckpt_has_backbone_prefix:
+        adapted = {}
+        for key, value in checkpoint_state_dict.items():
+            if key.startswith("backbone."):
+                adapted[key] = value
+            else:
+                adapted[f"backbone.{key}"] = value
+        return (
+            adapted,
+            "[INFO] Adapted resume checkpoint state_dict from legacy key format to 'backbone.*' format.",
+        )
+
+    if (not model_has_backbone_prefix) and ckpt_has_backbone_prefix:
+        adapted = {}
+        for key, value in checkpoint_state_dict.items():
+            if key.startswith("backbone."):
+                adapted[key[len("backbone.") :]] = value
+            else:
+                adapted[key] = value
+        return (
+            adapted,
+            "[INFO] Adapted resume checkpoint state_dict from 'backbone.*' format to legacy key format.",
+        )
+
+    return checkpoint_state_dict, None
+
+
 def load_model_with_label_alignment(
     model: nn.Module,
     checkpoint_state: dict,
@@ -767,7 +803,21 @@ def main() -> None:
                     f"resume={resume_model_name}, current={args.model_name}"
                 )
 
-        model.load_state_dict(resume_ckpt["model_state_dict"], strict=True)
+        resume_model_state_dict = resume_ckpt["model_state_dict"]
+        try:
+            model.load_state_dict(resume_model_state_dict, strict=True)
+        except RuntimeError as exc:
+            adapted_state_dict, adaptation_msg = adapt_state_dict_prefix_for_model(
+                model, resume_model_state_dict
+            )
+            if adaptation_msg is not None:
+                print(adaptation_msg, flush=True)
+                model.load_state_dict(adapted_state_dict, strict=True)
+            else:
+                raise RuntimeError(
+                    "Failed to load resume checkpoint model_state_dict. "
+                    "Likely architecture mismatch."
+                ) from exc
         if "frontend_state_dict" in resume_ckpt:
             frontend.load_state_dict(resume_ckpt["frontend_state_dict"], strict=False)
 
