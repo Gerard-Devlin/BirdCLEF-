@@ -163,11 +163,18 @@ def main() -> None:
         [submission_columns.index(label) if label in submission_columns else -1 for label in labels],
         dtype=np.int32,
     )
+    covered_labels = int((model_to_submission >= 0).sum())
+    print(
+        f"Label coverage: model={len(labels)} | submission={len(submission_columns)} | "
+        f"matched={covered_labels} | unmatched_in_submission={len(submission_columns) - covered_labels}"
+    )
     # Start from sample_submission defaults so local dry-run still outputs valid values
     # even when competition test audio files are not exposed in draft sessions.
     output_probs = submission.iloc[:, 1:].to_numpy(copy=True, dtype=np.float32)
+    default_probs = output_probs.copy()
     soundscape_index = build_soundscape_index(test_soundscapes_dir)
     missing_soundscapes = []
+    updated_rows = 0
 
     for soundscape_id, items in tqdm(grouped_rows.items(), desc="soundscapes"):
         try:
@@ -200,6 +207,7 @@ def main() -> None:
             row_prob = probs[local_idx]
             valid_mask = model_to_submission >= 0
             output_probs[row_idx, model_to_submission[valid_mask]] = row_prob[valid_mask]
+            updated_rows += 1
 
     submission.iloc[:, 1:] = output_probs
     submission.to_csv(args.output, index=False, float_format="%.6f")
@@ -210,6 +218,11 @@ def main() -> None:
             f"[WARN] Missing soundscape files: {len(missing_soundscapes)} groups "
             f"(strict mode off)."
         )
+    changed_values = int(np.count_nonzero(np.abs(output_probs - default_probs) > 1e-12))
+    print(
+        f"Prediction updates: updated_rows={updated_rows}/{num_rows} | "
+        f"changed_values={changed_values}"
+    )
     print(f"Saved submission to {args.output} | rows={len(submission)} | time={elapsed:.1f}s")
 
 
