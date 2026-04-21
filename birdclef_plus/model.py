@@ -5,9 +5,11 @@ from torch import nn
 
 try:
     from torchvision.models import efficientnet_b0, efficientnet_b2
-except Exception:  # pragma: no cover - optional dependency path
+    _TORCHVISION_IMPORT_ERROR = None
+except Exception as exc:  # pragma: no cover - optional dependency path
     efficientnet_b0 = None
     efficientnet_b2 = None
+    _TORCHVISION_IMPORT_ERROR = exc
 
 
 SUPPORTED_MODEL_NAMES = ("custom_cnn", "efficientnet_b0", "efficientnet_b2")
@@ -114,9 +116,13 @@ def _replace_first_conv_to_single_channel(conv: nn.Conv2d) -> nn.Conv2d:
 
 def _build_efficientnet(model_name: str, num_classes: int, dropout: float) -> nn.Module:
     if efficientnet_b0 is None or efficientnet_b2 is None:
+        details = ""
+        if _TORCHVISION_IMPORT_ERROR is not None:
+            details = f" Original import error: {_TORCHVISION_IMPORT_ERROR!r}"
         raise ImportError(
             "torchvision is required for EfficientNet backbones. "
             "Please install torchvision, or use --model-name custom_cnn."
+            + details
         )
 
     model_name = str(model_name).lower()
