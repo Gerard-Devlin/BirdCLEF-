@@ -13,7 +13,7 @@ import pandas as pd
 import torch
 from sklearn.model_selection import StratifiedKFold
 from torch import nn
-from torch.utils.data import DataLoader
+from torch.utils.data import ConcatDataset, DataLoader
 from tqdm.auto import tqdm
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -22,9 +22,11 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from birdclef_plus import (
     BirdCLEFNet,
+    BirdSoundscapeDataset,
     BirdTrainDataset,
     MelSpectrogramFrontend,
     build_label_mapping,
+    load_soundscape_labels_csv,
     load_train_csv,
     macro_auc_skip_empty,
     seed_everything,
@@ -35,6 +37,36 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="BirdCLEF+ 2026 baseline training")
     parser.add_argument("--train-csv", type=Path, required=True)
     parser.add_argument("--audio-dir", type=Path, required=True)
+    parser.add_argument(
+        "--submission-csv",
+        type=Path,
+        default=None,
+        help=(
+            "Optional sample_submission.csv path. If provided, model output labels will "
+            "match submission columns exactly."
+        ),
+    )
+    parser.add_argument(
+        "--soundscape-labels-csv",
+        type=Path,
+        default=None,
+        help="Optional train_soundscapes_labels.csv path for soundscape fine-tuning rows.",
+    )
+    parser.add_argument(
+        "--soundscape-audio-dir",
+        type=Path,
+        default=None,
+        help="Optional train_soundscapes directory for soundscape fine-tuning rows.",
+    )
+    parser.add_argument(
+        "--soundscape-repeat",
+        type=int,
+        default=4,
+        help=(
+            "Repeat the soundscape train dataset this many times inside one epoch "
+            "to increase its sampling weight."
+        ),
+    )
     parser.add_argument("--output-dir", type=Path, default=Path("outputs/baseline"))
     parser.add_argument("--folds", type=int, default=5)
     parser.add_argument("--fold", type=int, default=0)
@@ -108,6 +140,23 @@ def assign_folds(df: pd.DataFrame, n_splits: int, seed: int) -> pd.DataFrame:
     for i, idx in enumerate(rare_index):
         df.loc[idx, "fold"] = i % n_splits
 
+    return df
+
+
+def assign_group_folds(
+    df: pd.DataFrame, group_col: str, n_splits: int, seed: int
+) -> pd.DataFrame:
+    if n_splits < 2:
+        df = df.copy()
+        df["fold"] = 0
+        return df
+
+    df = df.copy()
+    groups = df[group_col].astype(str).unique().tolist()
+    rng = np.random.default_rng(seed)
+    rng.shuffle(groups)
+    group_to_fold = {group: i % n_splits for i, group in enumerate(groups)}
+    df["fold"] = df[group_col].astype(str).map(group_to_fold).astype(int)
     return df
 
 
@@ -254,6 +303,50 @@ def count_non_finite_params(module: nn.Module) -> int:
     return total_bad
 
 
+def load_model_with_label_alignment(
+    model: nn.Module,
+    checkpoint_state: dict,
+    checkpoint_labels,
+    current_labels,
+) -> int:
+    model_state = model.state_dict()
+    copied_labels = 0
+
+    backbone_state = {}
+    for key, value in checkpoint_state.items():
+        if key.startswith("head."):
+            continue
+        if key in model_state and model_state[key].shape == value.shape:
+            backbone_state[key] = value
+    model.load_state_dict(backbone_state, strict=False)
+
+    src_w = checkpoint_state.get("head.weight")
+    src_b = checkpoint_state.get("head.bias")
+    if src_w is None or src_b is None:
+        return copied_labels
+    if checkpoint_labels is None:
+        return copied_labels
+
+    checkpoint_label_to_idx = {str(label): i for i, label in enumerate(checkpoint_labels)}
+    dst_w = model_state["head.weight"].clone()
+    dst_b = model_state["head.bias"].clone()
+
+    for dst_idx, label in enumerate(current_labels):
+        src_idx = checkpoint_label_to_idx.get(str(label))
+        if src_idx is None:
+            continue
+        if src_idx >= src_w.shape[0]:
+            continue
+        dst_w[dst_idx] = src_w[src_idx]
+        dst_b[dst_idx] = src_b[src_idx]
+        copied_labels += 1
+
+    model_state["head.weight"] = dst_w
+    model_state["head.bias"] = dst_b
+    model.load_state_dict(model_state, strict=False)
+    return copied_labels
+
+
 def build_checkpoint(
     *,
     epoch: int,
@@ -335,26 +428,115 @@ def main() -> None:
     valid_df = df[df["fold"] == args.fold].reset_index(drop=True)
     print(f"Train rows: {len(train_df)}, Valid rows: {len(valid_df)}, Fold: {args.fold}")
 
-    labels = build_label_mapping(df)
+    submission_csv = args.submission_csv
+    if submission_csv is None:
+        auto_submission_csv = args.train_csv.parent / "sample_submission.csv"
+        if auto_submission_csv.exists():
+            submission_csv = auto_submission_csv
+
+    submission_labels = None
+    if submission_csv is not None:
+        if not submission_csv.exists():
+            raise FileNotFoundError(f"Submission CSV not found: {submission_csv}")
+        submission_df = pd.read_csv(submission_csv, nrows=1)
+        submission_labels = [str(column) for column in submission_df.columns.tolist()[1:]]
+        print(
+            f"Submission label space loaded from {submission_csv} "
+            f"({len(submission_labels)} classes)."
+        )
+
+    soundscape_labels_csv = args.soundscape_labels_csv
+    if soundscape_labels_csv is None:
+        auto_soundscape_labels_csv = args.train_csv.parent / "train_soundscapes_labels.csv"
+        if auto_soundscape_labels_csv.exists():
+            soundscape_labels_csv = auto_soundscape_labels_csv
+
+    soundscape_audio_dir = args.soundscape_audio_dir
+    if soundscape_audio_dir is None:
+        auto_soundscape_audio_dir = args.train_csv.parent / "train_soundscapes"
+        if auto_soundscape_audio_dir.exists():
+            soundscape_audio_dir = auto_soundscape_audio_dir
+
+    soundscape_df = None
+    train_soundscape_df = None
+    valid_soundscape_df = None
+    if soundscape_labels_csv is not None or soundscape_audio_dir is not None:
+        if soundscape_labels_csv is None or soundscape_audio_dir is None:
+            raise ValueError(
+                "To enable soundscape training, both --soundscape-labels-csv "
+                "and --soundscape-audio-dir must be provided (or both files exist in dataset dir)."
+            )
+        if not soundscape_labels_csv.exists():
+            raise FileNotFoundError(f"Soundscape labels CSV not found: {soundscape_labels_csv}")
+        if not soundscape_audio_dir.exists():
+            raise FileNotFoundError(f"Soundscape audio directory not found: {soundscape_audio_dir}")
+
+        soundscape_df = load_soundscape_labels_csv(soundscape_labels_csv)
+        soundscape_df = assign_group_folds(
+            soundscape_df, group_col="filename", n_splits=args.folds, seed=args.seed
+        )
+        train_soundscape_df = soundscape_df[soundscape_df["fold"] != args.fold].reset_index(drop=True)
+        valid_soundscape_df = soundscape_df[soundscape_df["fold"] == args.fold].reset_index(drop=True)
+        print(
+            f"Soundscape rows: train={len(train_soundscape_df)}, valid={len(valid_soundscape_df)} "
+            f"(source={soundscape_labels_csv})"
+        )
+
+    labels = build_label_mapping(
+        df, soundscape_df=soundscape_df, submission_labels=submission_labels
+    )
     label_to_idx = {label: i for i, label in enumerate(labels)}
+    print(f"Model label space: {len(labels)} classes.")
     (args.output_dir / "labels.json").write_text(
         json.dumps(labels, ensure_ascii=False, indent=2), encoding="utf-8"
     )
 
-    train_dataset = BirdTrainDataset(
+    train_audio_dataset = BirdTrainDataset(
         dataframe=train_df,
         audio_dir=args.audio_dir,
         label_to_idx=label_to_idx,
         segment_seconds=args.segment_seconds,
         is_train=True,
     )
-    valid_dataset = BirdTrainDataset(
+    valid_audio_dataset = BirdTrainDataset(
         dataframe=valid_df,
         audio_dir=args.audio_dir,
         label_to_idx=label_to_idx,
         segment_seconds=args.segment_seconds,
         is_train=False,
     )
+
+    train_datasets = [train_audio_dataset]
+    valid_datasets = [valid_audio_dataset]
+
+    if train_soundscape_df is not None and valid_soundscape_df is not None:
+        train_soundscape_dataset = BirdSoundscapeDataset(
+            dataframe=train_soundscape_df,
+            audio_dir=soundscape_audio_dir,
+            label_to_idx=label_to_idx,
+            segment_seconds=args.segment_seconds,
+            is_train=True,
+        )
+        valid_soundscape_dataset = BirdSoundscapeDataset(
+            dataframe=valid_soundscape_df,
+            audio_dir=soundscape_audio_dir,
+            label_to_idx=label_to_idx,
+            segment_seconds=args.segment_seconds,
+            is_train=False,
+        )
+
+        repeat_times = max(1, int(args.soundscape_repeat))
+        for _ in range(repeat_times):
+            train_datasets.append(train_soundscape_dataset)
+        valid_datasets.append(valid_soundscape_dataset)
+        print(
+            f"Enabled soundscape training with repeat={repeat_times}. "
+            f"Train samples total={len(train_audio_dataset) + repeat_times * len(train_soundscape_dataset)}; "
+            f"Valid samples total={len(valid_audio_dataset) + len(valid_soundscape_dataset)}"
+        )
+
+    train_dataset = train_datasets[0] if len(train_datasets) == 1 else ConcatDataset(train_datasets)
+    valid_dataset = valid_datasets[0] if len(valid_datasets) == 1 else ConcatDataset(valid_datasets)
 
     train_loader = DataLoader(
         train_dataset,
