@@ -95,11 +95,41 @@ nohup env PYTHONNOUSERSITE=1 python scripts/train_baseline.py \
 echo $! > logs/fold0_full_resume.pid
 ```
 
+Resume from best checkpoint (recommended for stable extension runs):
+
+```bash
+cd ~/birdclef+
+mkdir -p logs
+
+nohup env PYTHONNOUSERSITE=1 python scripts/train_baseline.py \
+  --train-csv dataset/train.csv \
+  --audio-dir dataset/train_audio \
+  --submission-csv dataset/sample_submission.csv \
+  --soundscape-labels-csv dataset/train_soundscapes_labels.csv \
+  --soundscape-audio-dir dataset/train_soundscapes \
+  --soundscape-repeat 4 \
+  --output-dir outputs/fold0_full \
+  --folds 5 \
+  --fold 0 \
+  --epochs 20 \
+  --batch-size 32 \
+  --num-workers 4 \
+  --learning-rate 5e-5 \
+  --mixup-alpha 0.0 \
+  --grad-clip-norm 1.0 \
+  --save-every-steps 200 \
+  --resume outputs/fold0_full/best_fold0.pth \
+  --resume-model-only \
+  > logs/fold0_full_resume_from_best.log 2>&1 &
+echo $! > logs/fold0_full_resume_from_best.pid
+```
+
 Notes:
 
 - `--save-every-steps 200`: save rolling checkpoint to `step_last_foldX.pth` every 200 optimizer steps.
 - `--resume <path>`: resume from `last_foldX.pth` or `step_last_foldX.pth`.
 - `--resume-model-only`: load only model weights from checkpoint, and reset optimizer/scheduler/scaler states (recommended when resumed training becomes unstable).
+- `--select-best-on soundscape` (default): choose best checkpoint by soundscape validation AUC (more aligned with leaderboard). Use `--select-best-on all` to use combined validation AUC.
 - When resuming, set `--epochs` larger than the epoch already stored in checkpoint, otherwise it will print `Nothing to train`.
 - `best_fold0.pth` is best-by-validation (`val_auc`) for inference; `last_fold0.pth` is latest-progress for resume.
 - For this new full-label pipeline, do not resume old checkpoints trained with only 206 classes.

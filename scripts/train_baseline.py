@@ -81,6 +81,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dropout", type=float, default=0.3)
     parser.add_argument("--amp", action="store_true")
     parser.add_argument(
+        "--select-best-on",
+        type=str,
+        choices=("all", "soundscape"),
+        default="soundscape",
+        help=(
+            "Metric used to decide best checkpoint. "
+            "'all' uses combined validation set; 'soundscape' uses soundscape-only validation."
+        ),
+    )
+    parser.add_argument(
         "--grad-clip-norm",
         type=float,
         default=1.0,
@@ -508,6 +518,7 @@ def main() -> None:
 
     train_datasets = [train_audio_dataset]
     valid_datasets = [valid_audio_dataset]
+    valid_soundscape_dataset = None
 
     if train_soundscape_df is not None and valid_soundscape_df is not None:
         train_soundscape_dataset = BirdSoundscapeDataset(
@@ -554,6 +565,22 @@ def main() -> None:
         pin_memory=True,
         drop_last=False,
     )
+    valid_soundscape_loader = None
+    if valid_soundscape_dataset is not None:
+        valid_soundscape_loader = DataLoader(
+            valid_soundscape_dataset,
+            batch_size=args.batch_size,
+            shuffle=False,
+            num_workers=args.num_workers,
+            pin_memory=True,
+            drop_last=False,
+        )
+    if args.select_best_on == "soundscape" and valid_soundscape_loader is None:
+        print(
+            "[WARN] --select-best-on soundscape requested but no soundscape validation data. "
+            "Falling back to combined validation metric.",
+            flush=True,
+        )
 
     frontend = MelSpectrogramFrontend(augment=True).to(device)
     model = BirdCLEFNet(num_classes=len(labels), dropout=args.dropout).to(device)
@@ -693,10 +720,46 @@ def main() -> None:
                     "Training has diverged. Stop and resume from best checkpoint with "
                     "--resume-model-only and a lower learning rate."
                 )
+            val_soundscape_loss = None
+            val_soundscape_score = None
+            y_true_soundscape = None
+            y_pred_soundscape = None
+            if valid_soundscape_loader is not None:
+                (
+                    val_soundscape_loss,
+                    val_soundscape_score,
+                    y_true_soundscape,
+                    y_pred_soundscape,
+                    bad_logits_batches_ss,
+                    _bad_loss_batches_ss,
+                ) = validate_one_epoch(
+                    model=model,
+                    frontend=frontend,
+                    loader=valid_soundscape_loader,
+                    criterion=criterion,
+                    device=device,
+                    use_amp=use_amp,
+                )
+                if bad_logits_batches_ss >= len(valid_soundscape_loader):
+                    raise RuntimeError(
+                        "Soundscape validation logits are non-finite in all batches. "
+                        "Training has diverged. Stop and resume from best checkpoint with "
+                        "--resume-model-only and a lower learning rate."
+                    )
+
+            selected_metric_name = "all"
+            selected_score = val_score
+            selected_y_true = y_true
+            selected_y_pred = y_pred
+            if args.select_best_on == "soundscape" and val_soundscape_score is not None:
+                selected_metric_name = "soundscape"
+                selected_score = float(val_soundscape_score)
+                selected_y_true = y_true_soundscape
+                selected_y_pred = y_pred_soundscape
             scheduler.step()
 
-            if val_score > best_score:
-                best_score = val_score
+            if selected_score > best_score:
+                best_score = selected_score
                 best_checkpoint = build_checkpoint(
                     epoch=epoch,
                     global_step=global_step,
@@ -712,8 +775,8 @@ def main() -> None:
                 atomic_torch_save(best_checkpoint, best_path)
                 np.savez_compressed(
                     args.output_dir / f"oof_fold{args.fold}.npz",
-                    y_true=y_true,
-                    y_pred=y_pred,
+                    y_true=selected_y_true,
+                    y_pred=selected_y_pred,
                 )
 
             last_checkpoint = build_checkpoint(
@@ -731,13 +794,22 @@ def main() -> None:
             atomic_torch_save(last_checkpoint, last_path)
 
             elapsed = time.time() - epoch_start
-            print(
+            message = (
                 f"Epoch {epoch:02d}/{args.epochs} | "
                 f"step={global_step} | "
-                f"train_loss={train_loss:.4f} | val_loss={val_loss:.4f} | "
-                f"val_auc={val_score:.5f} | best_auc={best_score:.5f} | "
+                f"train_loss={train_loss:.4f} | val_all_loss={val_loss:.4f} | "
+                f"val_all_auc={val_score:.5f}"
+            )
+            if val_soundscape_score is not None and val_soundscape_loss is not None:
+                message += (
+                    f" | val_soundscape_loss={val_soundscape_loss:.4f} "
+                    f"| val_soundscape_auc={val_soundscape_score:.5f}"
+                )
+            message += (
+                f" | best_{selected_metric_name}_auc={best_score:.5f} | "
                 f"epoch_time={elapsed:.1f}s"
             )
+            print(message)
     except (KeyboardInterrupt, SystemExit):
         if not args.no_save_on_interrupt:
             print("\n[WARN] Training interrupted, saving interrupt checkpoint...", flush=True)
@@ -758,7 +830,10 @@ def main() -> None:
         raise
 
     total_minutes = (time.time() - train_start) / 60.0
-    print(f"Training done. best_auc={best_score:.5f} | total_time={total_minutes:.1f} min")
+    metric_name = args.select_best_on
+    print(
+        f"Training done. best_{metric_name}_auc={best_score:.5f} | total_time={total_minutes:.1f} min"
+    )
     print(f"Best checkpoint: {best_path}")
 
 
