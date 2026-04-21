@@ -64,6 +64,19 @@ def resolve_soundscape_path(
     if soundscape_index and soundscape_id in soundscape_index:
         return soundscape_index[soundscape_id]
 
+    # Fuzzy stem match: some runtimes can expose soundscape files with
+    # slight naming differences (prefix/suffix variants).
+    if soundscape_index:
+        fuzzy_matches = []
+        for stem, path in soundscape_index.items():
+            if stem.startswith(soundscape_id) or soundscape_id.startswith(stem):
+                fuzzy_matches.append(path)
+        if len(fuzzy_matches) == 1:
+            return fuzzy_matches[0]
+        if len(fuzzy_matches) > 1:
+            fuzzy_matches.sort(key=lambda p: abs(len(p.stem) - len(soundscape_id)))
+            return fuzzy_matches[0]
+
     for ext in (".ogg", ".wav", ".flac", ".mp3"):
         candidate = test_dir / f"{soundscape_id}{ext}"
         if candidate.exists():
