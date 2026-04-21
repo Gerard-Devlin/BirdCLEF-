@@ -234,6 +234,7 @@ print("competition_dir:", competition_dir)
   --checkpoint {bundle_dir}/checkpoint.pth \
   --competition-dir {competition_dir} \
   --postprocess-topn 1 \
+  --min-updated-ratio 0.99 \
   --output /kaggle/working/submission.csv
 ```
 
@@ -249,6 +250,7 @@ If you have multiple fold checkpoints in your bundle, you can ensemble directly:
     {bundle_dir}/fold4_best.pth \
   --competition-dir {competition_dir} \
   --postprocess-topn 1 \
+  --min-updated-ratio 0.99 \
   --output /kaggle/working/submission.csv
 ```
 
@@ -265,6 +267,7 @@ Then click `Save Version` + `Submit to Competition`.
 
 Tip: in draft sessions Kaggle may not expose real test soundscape files. Use `--strict-missing` only for final verification runs.
 `--postprocess-topn 1` is enabled by default and usually improves leaderboard alignment on soundscapes.
+By default, inference now fails fast if checkpoint labels do not cover all submission labels; this prevents accidentally submitting old 206-class checkpoints.
 
 ### 5) Notes For Code Competition Constraints
 

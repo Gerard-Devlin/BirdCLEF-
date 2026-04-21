@@ -30,6 +30,14 @@ def parse_args() -> argparse.Namespace:
         help="One or more checkpoints. If multiple are provided, predictions are ensembled by averaging.",
     )
     parser.add_argument(
+        "--allow-partial-label-coverage",
+        action="store_true",
+        help=(
+            "Allow checkpoints that do not cover all submission labels. "
+            "By default, inference fails fast to avoid accidental submission with old label space."
+        ),
+    )
+    parser.add_argument(
         "--competition-dir",
         type=Path,
         default=Path("/kaggle/input/birdclef-2026"),
@@ -49,6 +57,15 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--output", type=Path, default=Path("submission.csv"))
+    parser.add_argument(
+        "--min-updated-ratio",
+        type=float,
+        default=0.0,
+        help=(
+            "Require at least this fraction of rows to be updated by model predictions. "
+            "Useful to catch path/mapping issues before submission (e.g. use 0.99 in final runs)."
+        ),
+    )
     parser.add_argument(
         "--strict-missing",
         action="store_true",
@@ -204,6 +221,13 @@ def main() -> None:
             dtype=np.int32,
         )
         covered_labels = int((model_to_submission >= 0).sum())
+        if (not args.allow_partial_label_coverage) and covered_labels < len(submission_columns):
+            missing_count = len(submission_columns) - covered_labels
+            raise ValueError(
+                "Checkpoint label space does not fully match sample_submission columns: "
+                f"{covered_labels}/{len(submission_columns)} covered, missing {missing_count}. "
+                "Use full-label checkpoint or pass --allow-partial-label-coverage if intentional."
+            )
         print(
             f"Loaded checkpoint: {ckpt_path} | labels={len(labels)} | "
             f"matched_submission_labels={covered_labels}/{len(submission_columns)}"
@@ -290,6 +314,12 @@ def main() -> None:
             f"(strict mode off)."
         )
     changed_values = int(np.count_nonzero(np.abs(output_probs - default_probs) > 1e-12))
+    updated_ratio = (float(updated_rows) / float(num_rows)) if num_rows > 0 else 0.0
+    if updated_ratio < float(args.min_updated_ratio):
+        raise RuntimeError(
+            f"updated_rows ratio too low: {updated_rows}/{num_rows}={updated_ratio:.4f}, "
+            f"which is below --min-updated-ratio={args.min_updated_ratio:.4f}."
+        )
     print(
         f"Prediction updates: updated_rows={updated_rows}/{num_rows} | "
         f"changed_values={changed_values}"

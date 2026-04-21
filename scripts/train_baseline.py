@@ -4,7 +4,7 @@ import argparse
 import json
 import time
 from pathlib import Path
-from typing import Callable, Optional, Tuple
+from typing import Callable, Dict, Optional, Tuple
 import sys
 import site
 
@@ -65,6 +65,24 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Repeat the soundscape train dataset this many times inside one epoch "
             "to increase its sampling weight."
+        ),
+    )
+    parser.add_argument(
+        "--soundscape-pseudo-csv",
+        type=Path,
+        default=None,
+        help=(
+            "Optional pseudo-labeled soundscape CSV. Pseudo rows are added to TRAIN split only "
+            "(validation remains real-labeled soundscapes)."
+        ),
+    )
+    parser.add_argument(
+        "--soundscape-pseudo-repeat",
+        type=int,
+        default=1,
+        help=(
+            "Repeat the pseudo-labeled soundscape train dataset this many times "
+            "inside one epoch."
         ),
     )
     parser.add_argument("--output-dir", type=Path, default=Path("outputs/baseline"))
@@ -162,11 +180,42 @@ def assign_group_folds(
         return df
 
     df = df.copy()
-    groups = df[group_col].astype(str).unique().tolist()
+    groups = sorted(df[group_col].astype(str).unique().tolist())
     rng = np.random.default_rng(seed)
     rng.shuffle(groups)
     group_to_fold = {group: i % n_splits for i, group in enumerate(groups)}
     df["fold"] = df[group_col].astype(str).map(group_to_fold).astype(int)
+    return df
+
+
+def build_group_fold_mapping(groups, n_splits: int, seed: int) -> Dict[str, int]:
+    groups = sorted({str(group) for group in groups})
+    if not groups:
+        return {}
+    if n_splits < 2:
+        return {group: 0 for group in groups}
+
+    rng = np.random.default_rng(seed)
+    rng.shuffle(groups)
+    return {group: i % n_splits for i, group in enumerate(groups)}
+
+
+def apply_group_fold_mapping(
+    df: pd.DataFrame, group_col: str, group_to_fold: Dict[str, int]
+) -> pd.DataFrame:
+    df = df.copy()
+    if not group_to_fold:
+        df["fold"] = 0
+        return df
+
+    mapped = df[group_col].astype(str).map(group_to_fold)
+    if mapped.isna().any():
+        missing_groups = sorted(df.loc[mapped.isna(), group_col].astype(str).unique().tolist())
+        raise ValueError(
+            "Found groups without fold assignment: "
+            f"{missing_groups[:10]} (total {len(missing_groups)})"
+        )
+    df["fold"] = mapped.astype(int)
     return df
 
 
@@ -469,30 +518,85 @@ def main() -> None:
         if auto_soundscape_audio_dir.exists():
             soundscape_audio_dir = auto_soundscape_audio_dir
 
+    soundscape_pseudo_csv = args.soundscape_pseudo_csv
+    if soundscape_pseudo_csv is None:
+        auto_soundscape_pseudo_csv = args.train_csv.parent / "train_soundscapes_pseudo.csv"
+        if auto_soundscape_pseudo_csv.exists():
+            soundscape_pseudo_csv = auto_soundscape_pseudo_csv
+
     soundscape_df = None
+    soundscape_real_df = None
+    soundscape_pseudo_df = None
     train_soundscape_df = None
     valid_soundscape_df = None
-    if soundscape_labels_csv is not None or soundscape_audio_dir is not None:
-        if soundscape_labels_csv is None or soundscape_audio_dir is None:
+    train_soundscape_pseudo_df = None
+    if (
+        soundscape_labels_csv is not None
+        or soundscape_pseudo_csv is not None
+        or soundscape_audio_dir is not None
+    ):
+        if (soundscape_labels_csv is None and soundscape_pseudo_csv is None) or soundscape_audio_dir is None:
             raise ValueError(
-                "To enable soundscape training, both --soundscape-labels-csv "
-                "and --soundscape-audio-dir must be provided (or both files exist in dataset dir)."
+                "To enable soundscape training, provide --soundscape-audio-dir and at least one "
+                "of --soundscape-labels-csv / --soundscape-pseudo-csv "
+                "(or keep files in dataset dir for auto-detection)."
             )
-        if not soundscape_labels_csv.exists():
-            raise FileNotFoundError(f"Soundscape labels CSV not found: {soundscape_labels_csv}")
         if not soundscape_audio_dir.exists():
             raise FileNotFoundError(f"Soundscape audio directory not found: {soundscape_audio_dir}")
+        if soundscape_labels_csv is not None:
+            if not soundscape_labels_csv.exists():
+                raise FileNotFoundError(f"Soundscape labels CSV not found: {soundscape_labels_csv}")
+            soundscape_real_df = load_soundscape_labels_csv(soundscape_labels_csv)
 
-        soundscape_df = load_soundscape_labels_csv(soundscape_labels_csv)
-        soundscape_df = assign_group_folds(
-            soundscape_df, group_col="filename", n_splits=args.folds, seed=args.seed
+        if soundscape_pseudo_csv is not None:
+            if not soundscape_pseudo_csv.exists():
+                raise FileNotFoundError(f"Soundscape pseudo CSV not found: {soundscape_pseudo_csv}")
+            soundscape_pseudo_df = load_soundscape_labels_csv(soundscape_pseudo_csv)
+
+        all_groups = []
+        if soundscape_real_df is not None:
+            all_groups.extend(soundscape_real_df["filename"].astype(str).tolist())
+        if soundscape_pseudo_df is not None:
+            all_groups.extend(soundscape_pseudo_df["filename"].astype(str).tolist())
+        group_to_fold = build_group_fold_mapping(
+            all_groups, n_splits=args.folds, seed=args.seed
         )
-        train_soundscape_df = soundscape_df[soundscape_df["fold"] != args.fold].reset_index(drop=True)
-        valid_soundscape_df = soundscape_df[soundscape_df["fold"] == args.fold].reset_index(drop=True)
-        print(
-            f"Soundscape rows: train={len(train_soundscape_df)}, valid={len(valid_soundscape_df)} "
-            f"(source={soundscape_labels_csv})"
-        )
+
+        if soundscape_real_df is not None:
+            soundscape_real_df = apply_group_fold_mapping(
+                soundscape_real_df, group_col="filename", group_to_fold=group_to_fold
+            )
+            train_soundscape_df = soundscape_real_df[
+                soundscape_real_df["fold"] != args.fold
+            ].reset_index(drop=True)
+            valid_soundscape_df = soundscape_real_df[
+                soundscape_real_df["fold"] == args.fold
+            ].reset_index(drop=True)
+            print(
+                f"Soundscape rows (real): train={len(train_soundscape_df)}, "
+                f"valid={len(valid_soundscape_df)} (source={soundscape_labels_csv})"
+            )
+
+        if soundscape_pseudo_df is not None:
+            soundscape_pseudo_df = apply_group_fold_mapping(
+                soundscape_pseudo_df, group_col="filename", group_to_fold=group_to_fold
+            )
+            train_soundscape_pseudo_df = soundscape_pseudo_df[
+                soundscape_pseudo_df["fold"] != args.fold
+            ].reset_index(drop=True)
+            print(
+                f"Soundscape rows (pseudo): train={len(train_soundscape_pseudo_df)}, "
+                f"valid=0 (source={soundscape_pseudo_csv})"
+            )
+
+        if soundscape_real_df is not None and soundscape_pseudo_df is not None:
+            soundscape_df = pd.concat(
+                [soundscape_real_df, soundscape_pseudo_df], ignore_index=True
+            )
+        elif soundscape_real_df is not None:
+            soundscape_df = soundscape_real_df
+        elif soundscape_pseudo_df is not None:
+            soundscape_df = soundscape_pseudo_df
 
     labels = build_label_mapping(
         df, soundscape_df=soundscape_df, submission_labels=submission_labels
@@ -548,8 +652,28 @@ def main() -> None:
             f"Valid samples total={len(valid_audio_dataset) + len(valid_soundscape_dataset)}"
         )
 
+    if train_soundscape_pseudo_df is not None and len(train_soundscape_pseudo_df) > 0:
+        train_soundscape_pseudo_dataset = BirdSoundscapeDataset(
+            dataframe=train_soundscape_pseudo_df,
+            audio_dir=soundscape_audio_dir,
+            label_to_idx=label_to_idx,
+            segment_seconds=args.segment_seconds,
+            is_train=True,
+        )
+        pseudo_repeat_times = max(1, int(args.soundscape_pseudo_repeat))
+        for _ in range(pseudo_repeat_times):
+            train_datasets.append(train_soundscape_pseudo_dataset)
+        print(
+            f"Enabled pseudo soundscape training with repeat={pseudo_repeat_times}. "
+            f"Pseudo train samples total={pseudo_repeat_times * len(train_soundscape_pseudo_dataset)}"
+        )
+
     train_dataset = train_datasets[0] if len(train_datasets) == 1 else ConcatDataset(train_datasets)
     valid_dataset = valid_datasets[0] if len(valid_datasets) == 1 else ConcatDataset(valid_datasets)
+    print(
+        f"Dataset sizes per epoch: train={len(train_dataset)}, valid={len(valid_dataset)}",
+        flush=True,
+    )
 
     train_loader = DataLoader(
         train_dataset,
