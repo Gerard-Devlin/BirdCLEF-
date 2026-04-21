@@ -29,6 +29,7 @@ python scripts/train_baseline.py \
   --soundscape-labels-csv dataset/train_soundscapes_labels.csv \
   --soundscape-audio-dir dataset/train_soundscapes \
   --soundscape-repeat 4 \
+  --model-name custom_cnn \
   --output-dir outputs/fold0_full \
   --folds 5 \
   --fold 0 \
@@ -37,6 +38,28 @@ python scripts/train_baseline.py \
   --num-workers 4 \
   --learning-rate 1e-4 \
   --mixup-alpha 0.0 \
+  --grad-clip-norm 1.0
+```
+
+Try EfficientNet backbone:
+
+```bash
+python scripts/train_baseline.py \
+  --train-csv dataset/train.csv \
+  --audio-dir dataset/train_audio \
+  --submission-csv dataset/sample_submission.csv \
+  --soundscape-labels-csv dataset/train_soundscapes_labels.csv \
+  --soundscape-audio-dir dataset/train_soundscapes \
+  --soundscape-repeat 4 \
+  --model-name efficientnet_b0 \
+  --output-dir outputs/fold0_effb0 \
+  --folds 5 \
+  --fold 0 \
+  --epochs 16 \
+  --batch-size 32 \
+  --num-workers 4 \
+  --learning-rate 1e-4 \
+  --mixup-alpha 0.2 \
   --grad-clip-norm 1.0
 ```
 
@@ -126,6 +149,7 @@ echo $! > logs/fold0_full_resume_from_best.pid
 
 Notes:
 
+- `--model-name`: choose backbone from `custom_cnn`, `efficientnet_b0`, `efficientnet_b2`.
 - `--save-every-steps 200`: save rolling checkpoint to `step_last_foldX.pth` every 200 optimizer steps.
 - `--resume <path>`: resume from `last_foldX.pth` or `step_last_foldX.pth`.
 - `--resume-model-only`: load only model weights from checkpoint, and reset optimizer/scheduler/scaler states (recommended when resumed training becomes unstable).

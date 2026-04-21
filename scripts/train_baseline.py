@@ -97,6 +97,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--mixup-alpha", type=float, default=0.2)
     parser.add_argument("--dropout", type=float, default=0.3)
+    parser.add_argument(
+        "--model-name",
+        type=str,
+        default="custom_cnn",
+        choices=("custom_cnn", "efficientnet_b0", "efficientnet_b2"),
+        help="Backbone model architecture.",
+    )
     parser.add_argument("--amp", action="store_true")
     parser.add_argument(
         "--select-best-on",
@@ -711,7 +718,9 @@ def main() -> None:
         selected_best_metric = "all"
 
     frontend = MelSpectrogramFrontend(augment=True).to(device)
-    model = BirdCLEFNet(num_classes=len(labels), dropout=args.dropout).to(device)
+    model = BirdCLEFNet(
+        num_classes=len(labels), dropout=args.dropout, model_name=args.model_name
+    ).to(device)
     criterion = nn.BCEWithLogitsLoss()
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay
@@ -749,6 +758,14 @@ def main() -> None:
             raise ValueError(
                 "Label mapping mismatch between resume checkpoint and current dataset."
             )
+        resume_args = resume_ckpt.get("args", {})
+        if isinstance(resume_args, dict):
+            resume_model_name = str(resume_args.get("model_name", "custom_cnn")).lower()
+            if resume_model_name != str(args.model_name).lower():
+                raise ValueError(
+                    "Model architecture mismatch between resume checkpoint and current run: "
+                    f"resume={resume_model_name}, current={args.model_name}"
+                )
 
         model.load_state_dict(resume_ckpt["model_state_dict"], strict=True)
         if "frontend_state_dict" in resume_ckpt:

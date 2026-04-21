@@ -30,6 +30,16 @@ def parse_args() -> argparse.Namespace:
         help="One or more checkpoints. If multiple are provided, predictions are ensembled by averaging.",
     )
     parser.add_argument(
+        "--model-name-override",
+        type=str,
+        default=None,
+        choices=("custom_cnn", "efficientnet_b0", "efficientnet_b2"),
+        help=(
+            "Force model architecture for all checkpoints. "
+            "By default, infer from checkpoint args['model_name']."
+        ),
+    )
+    parser.add_argument(
         "--allow-partial-label-coverage",
         action="store_true",
         help=(
@@ -208,7 +218,25 @@ def main() -> None:
             checkpoint = torch.load(ckpt_path, map_location="cpu")
 
         labels: List[str] = checkpoint["labels"]
-        model = BirdCLEFNet(num_classes=len(labels))
+        checkpoint_args = checkpoint.get("args", {})
+        if isinstance(checkpoint_args, dict):
+            inferred_model_name = checkpoint_args.get("model_name", "custom_cnn")
+            inferred_dropout = checkpoint_args.get("dropout", 0.3)
+        else:
+            inferred_model_name = "custom_cnn"
+            inferred_dropout = 0.3
+        model_name = (
+            str(args.model_name_override).lower()
+            if args.model_name_override is not None
+            else str(inferred_model_name).lower()
+        )
+        dropout = float(inferred_dropout)
+
+        model = BirdCLEFNet(
+            num_classes=len(labels),
+            dropout=dropout,
+            model_name=model_name,
+        )
         model.load_state_dict(checkpoint["model_state_dict"], strict=True)
         frontend = MelSpectrogramFrontend(augment=False)
         if "frontend_state_dict" in checkpoint:
@@ -229,7 +257,7 @@ def main() -> None:
                 "Use full-label checkpoint or pass --allow-partial-label-coverage if intentional."
             )
         print(
-            f"Loaded checkpoint: {ckpt_path} | labels={len(labels)} | "
+            f"Loaded checkpoint: {ckpt_path} | model={model_name} | labels={len(labels)} | "
             f"matched_submission_labels={covered_labels}/{len(submission_columns)}"
         )
         model_entries.append(
