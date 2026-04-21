@@ -1,63 +1,61 @@
 ﻿# BirdCLEF+ 2026
+
 > Acoustic Species Identification in the Pantanal, South America
 
 ## Practical Workflow (Server -> Kaggle)
+
 This repository now includes a runnable baseline pipeline for:
+
 - server-side training (`scripts/train_baseline.py`)
 - Kaggle inference/submission (`scripts/infer_kaggle.py`)
 - packaging model + code for Kaggle dataset upload (`scripts/prepare_kaggle_bundle.py`)
 
 ### Project Structure
+
 - `birdclef_plus/`: shared package (audio/data/model/metrics/utils)
 - `scripts/train_baseline.py`: train one fold and save `best_foldX.pth`
 - `scripts/infer_kaggle.py`: generate `submission.csv` from Kaggle test soundscapes
 - `scripts/prepare_kaggle_bundle.py`: package checkpoint + inference code for Kaggle
 
 ### 1) Train On Your Server
+
 ```bash
 pip install -r requirements.txt
 
 python scripts/train_baseline.py \
   --train-csv dataset/train.csv \
   --audio-dir dataset/train_audio \
-  --output-dir outputs/fold0 \
+  --submission-csv dataset/sample_submission.csv \
+  --soundscape-labels-csv dataset/train_soundscapes_labels.csv \
+  --soundscape-audio-dir dataset/train_soundscapes \
+  --soundscape-repeat 4 \
+  --output-dir outputs/fold0_full \
   --folds 5 \
   --fold 0 \
-  --epochs 12 \
+  --epochs 16 \
   --batch-size 32 \
   --num-workers 4 \
-  --amp
+  --learning-rate 1e-4 \
+  --mixup-alpha 0.0 \
+  --grad-clip-norm 1.0
 ```
 
 Recommended: long-running background training with `nohup`.
 
 Start training in background (from scratch):
-```bash
-mkdir -p logs
-nohup env PYTHONNOUSERSITE=1 python scripts/train_baseline.py \
-  --train-csv dataset/train.csv \
-  --audio-dir dataset/train_audio \
-  --output-dir outputs/fold0 \
-  --folds 5 \
-  --fold 0 \
-  --epochs 12 \
-  --batch-size 32 \
-  --num-workers 4 \
-  --learning-rate 1e-4 \
-  --mixup-alpha 0.0 \
-  --grad-clip-norm 1.0 \
-  --save-every-steps 200 \
-  > logs/fold0_nohup.log 2>&1 &
-echo $! > logs/fold0.pid
-```
 
-Resume training in background:
 ```bash
+cd ~/birdclef+
 mkdir -p logs
+
 nohup env PYTHONNOUSERSITE=1 python scripts/train_baseline.py \
   --train-csv dataset/train.csv \
   --audio-dir dataset/train_audio \
-  --output-dir outputs/fold0 \
+  --submission-csv dataset/sample_submission.csv \
+  --soundscape-labels-csv dataset/train_soundscapes_labels.csv \
+  --soundscape-audio-dir dataset/train_soundscapes \
+  --soundscape-repeat 4 \
+  --output-dir outputs/fold0_full \
   --folds 5 \
   --fold 0 \
   --epochs 16 \
@@ -67,107 +65,177 @@ nohup env PYTHONNOUSERSITE=1 python scripts/train_baseline.py \
   --mixup-alpha 0.0 \
   --grad-clip-norm 1.0 \
   --save-every-steps 200 \
-  --resume outputs/fold0/last_fold0.pth \
-  > logs/fold0_resume.log 2>&1 &
-echo $! > logs/fold0_resume.pid
+  > logs/fold0_full.log 2>&1 &
+echo $! > logs/fold0_full.pid
+```
+
+Resume training in background:
+
+```bash
+mkdir -p logs
+nohup env PYTHONNOUSERSITE=1 python scripts/train_baseline.py \
+  --train-csv dataset/train.csv \
+  --audio-dir dataset/train_audio \
+  --submission-csv dataset/sample_submission.csv \
+  --soundscape-labels-csv dataset/train_soundscapes_labels.csv \
+  --soundscape-audio-dir dataset/train_soundscapes \
+  --soundscape-repeat 4 \
+  --output-dir outputs/fold0_full \
+  --folds 5 \
+  --fold 0 \
+  --epochs 20 \
+  --batch-size 32 \
+  --num-workers 4 \
+  --learning-rate 1e-4 \
+  --mixup-alpha 0.0 \
+  --grad-clip-norm 1.0 \
+  --save-every-steps 200 \
+  --resume outputs/fold0_full/last_fold0.pth \
+  > logs/fold0_full_resume.log 2>&1 &
+echo $! > logs/fold0_full_resume.pid
 ```
 
 Notes:
+
 - `--save-every-steps 200`: save rolling checkpoint to `step_last_foldX.pth` every 200 optimizer steps.
 - `--resume <path>`: resume from `last_foldX.pth` or `step_last_foldX.pth`.
 - `--resume-model-only`: load only model weights from checkpoint, and reset optimizer/scheduler/scaler states (recommended when resumed training becomes unstable).
 - When resuming, set `--epochs` larger than the epoch already stored in checkpoint, otherwise it will print `Nothing to train`.
 - `best_fold0.pth` is best-by-validation (`val_auc`) for inference; `last_fold0.pth` is latest-progress for resume.
+- For this new full-label pipeline, do not resume old checkpoints trained with only 206 classes.
 
 Monitor / stop:
+
 ```bash
-tail -f logs/fold0_nohup.log
-ps -fp $(cat logs/fold0.pid)
-kill $(cat logs/fold0.pid)
+tail -f logs/fold0_full.log
+ps -fp $(cat logs/fold0_full.pid)
+kill $(cat logs/fold0_full.pid)
 ```
 
 If you see frequent `Non-finite loss detected (nan)`:
+
 1. Retry without AMP (`remove --amp`)
 2. Lower learning rate (`--learning-rate 1e-4`)
 3. Keep gradient clipping enabled (`--grad-clip-norm 1.0`)
 
 Run multiple folds (example):
+
 ```bash
 for FOLD in 0 1 2 3 4; do
   python scripts/train_baseline.py \
     --train-csv dataset/train.csv \
     --audio-dir dataset/train_audio \
-    --output-dir outputs/fold${FOLD} \
+    --submission-csv dataset/sample_submission.csv \
+    --soundscape-labels-csv dataset/train_soundscapes_labels.csv \
+    --soundscape-audio-dir dataset/train_soundscapes \
+    --soundscape-repeat 4 \
+    --output-dir outputs/fold${FOLD}_full \
     --folds 5 \
     --fold ${FOLD} \
-    --epochs 12 \
+    --epochs 16 \
     --batch-size 32 \
     --num-workers 4 \
-    --amp
+    --learning-rate 1e-4 \
+    --mixup-alpha 0.0 \
+    --grad-clip-norm 1.0
 done
 ```
 
 ### 2) Package Inference Assets For Kaggle
+
 ```bash
 python scripts/prepare_kaggle_bundle.py \
-  --checkpoint outputs/fold0/best_fold0.pth \
-  --output-dir build/kaggle_bundle_fold0
+  --checkpoint outputs/fold0_full/best_fold0.pth \
+  --output-dir build/kaggle_bundle_fold0_full
 ```
 
 This creates:
-- `build/kaggle_bundle_fold0/checkpoint.pth`
-- `build/kaggle_bundle_fold0/scripts/infer_kaggle.py`
-- `build/kaggle_bundle_fold0/birdclef_plus/*`
+
+- `build/kaggle_bundle_fold0_full/checkpoint.pth`
+- `build/kaggle_bundle_fold0_full/scripts/infer_kaggle.py`
+- `build/kaggle_bundle_fold0_full/birdclef_plus/*`
 
 ### 3) Upload Bundle As A Kaggle Dataset
+
 For Kaggle web upload (single archive file), first create a tarball:
+
 ```bash
 cd build
-tar -czf kaggle_bundle_fold0.tar.gz kaggle_bundle_fold0
+tar -czf kaggle_bundle_fold0_full.tar.gz kaggle_bundle_fold0_full
 ```
 
-Then upload `build/kaggle_bundle_fold0.tar.gz` in the Kaggle Dataset web UI.
+Then upload `build/kaggle_bundle_fold0_full.tar.gz` in the Kaggle Dataset web UI.
 
 Or upload with Kaggle CLI (directory upload):
+
 ```bash
-kaggle datasets init -p build/kaggle_bundle_fold0
-# edit build/kaggle_bundle_fold0/dataset-metadata.json
-kaggle datasets create -p build/kaggle_bundle_fold0
+kaggle datasets init -p build/kaggle_bundle_fold0_full
+# edit build/kaggle_bundle_fold0_full/dataset-metadata.json
+kaggle datasets create -p build/kaggle_bundle_fold0_full
 ```
 
 For updates:
+
 ```bash
-kaggle datasets version -p build/kaggle_bundle_fold0 -m "update checkpoint"
+kaggle datasets version -p build/kaggle_bundle_fold0_full -m "update checkpoint"
 ```
 
 ### 4) Run Submission Notebook On Kaggle
+
 In your Kaggle competition notebook:
+
 1. Add data source: `birdclef-2026` (competition data)
 2. Add your uploaded bundle dataset
-3. Run:
+3. Use these cells:
 
-```bash
-python /kaggle/input/<your-bundle-dataset>/scripts/infer_kaggle.py \
-  --checkpoint /kaggle/input/<your-bundle-dataset>/checkpoint.pth \
-  --competition-dir /kaggle/input/birdclef-2026 \
-  --output submission.csv
+```python
+import os
+
+bundle_dir = "/kaggle/input/datasets/<your-user>/versionX/kaggle_bundle_fold0_full"
+candidates = ["/kaggle/input/competitions/birdclef-2026", "/kaggle/input/birdclef-2026"]
+competition_dir = next((p for p in candidates if os.path.exists(p)), None)
+
+print("bundle_dir:", bundle_dir, "exists:", os.path.exists(bundle_dir))
+print("competition_dir:", competition_dir)
+```
+
+```python
+!PYTHONNOUSERSITE=1 python {bundle_dir}/scripts/infer_kaggle.py \
+  --checkpoint {bundle_dir}/checkpoint.pth \
+  --competition-dir {competition_dir} \
+  --output /kaggle/working/submission.csv
+```
+
+```python
+import numpy as np, pandas as pd, os
+sub = pd.read_csv("/kaggle/working/submission.csv")
+samp = pd.read_csv(f"{competition_dir}/sample_submission.csv")
+print("shape:", sub.shape)
+print("changed_ratio:", (np.abs(sub.iloc[:,1:].values - samp.iloc[:,1:].values) > 1e-12).mean())
+display(sub.head(3))
 ```
 
 Then click `Save Version` + `Submit to Competition`.
 
+Tip: in draft sessions Kaggle may not expose real test soundscape files. Use `--strict-missing` only for final verification runs.
+
 ### 5) Notes For Code Competition Constraints
+
 - Keep inference CPU-friendly to stay within 90 minutes.
 - Internet is disabled in submission runtime.
 - Output file must be named `submission.csv`.
 - `infer_kaggle.py` aligns model labels to `sample_submission` columns automatically.
 
 ### Troubleshooting: `Couldn't find appropriate backend ... .ogg`
+
 If training fails when reading OGG files, check available audio backends:
+
 ```bash
 python -c "import torchaudio; print(torchaudio.list_audio_backends())"
 ```
 
 Then install fallback decoder support:
+
 ```bash
 python -m pip install soundfile
 ```
@@ -175,6 +243,7 @@ python -m pip install soundfile
 The loader in this repo now tries `torchaudio` first, then falls back to `soundfile`, then `librosa`.
 
 To audit dataset integrity (missing/corrupt audio):
+
 ```bash
 python scripts/check_dataset_integrity.py \
   --train-csv dataset/train.csv \
@@ -182,9 +251,11 @@ python scripts/check_dataset_integrity.py \
 ```
 
 ## Overview
+
 The goal of this competition is to develop machine learning frameworks capable of identifying understudied species within continuous audio data from Brazil's Pantanal wetlands. Successful solutions will help advance biodiversity monitoring in the last wild places on Earth.
 
 ## Description
+
 How do you protect an ecosystem you can鈥檛 fully see? One way is to listen.
 
 This competition involves building models that automatically identify wildlife species from their vocalizations in audio recordings collected across the Pantanal wetlands. This work will support more reliable biodiversity monitoring in one of the world鈥檚 most diverse and threatened ecosystems.
@@ -201,6 +272,7 @@ This competition focuses on the development of machine learning models that iden
 Listening carefully, and at scale, may be one of the most effective tools available to protect this landscape.
 
 ## Timeline
+
 March 11, 2026 - Start Date.
 
 May 27, 2026 - Entry Deadline. You must accept the competition rules before this date to compete.
@@ -218,6 +290,7 @@ Submission Format
 For each row_id, you should predict the probability that a given species was present. There is one column per species. Each row covers a five-second window of audio.
 
 ## Prizes
+
 1st Place - $15,000
 2nd Place - $10,000
 3rd Place - $8,000
@@ -240,6 +313,7 @@ July 6, 2026 - Camera-ready submission deadline
 Additional information on the submission process will be posted ahead of time on the discussion forum.
 
 ## Working Note Award Criteria
+
 Criteria for the BirdCLEF+ Best Working Note Award:
 
 Originality. The value of a paper is a function of the degree to which it presents new or novel technical material. Does the paper present results previously unknown? Does it push forward the frontiers of knowledge? Does it present new methods for solving old problems or new viewpoints on old problems? Or, on the other hand, is it a rehash of information already known?
@@ -291,6 +365,7 @@ c) Readability and organization
 1 point: Work doesn't meet scientific standards
 
 ## Code Requirements
+
 This is a Code Competition
 
 Submissions to this competition must be made through Notebooks. For the "Submit" button to be active after a commit, the following conditions must be met:
@@ -303,6 +378,7 @@ Submission file must be named submission.csv
 Please see the Code Competition FAQ for more information on how to submit. And review the code debugging doc if you encounter submission errors.
 
 ## Acknowledgements
+
 The development of the competition dataset was supported by the Bezos Earth Fund AI for Climate and Nature Grand Challenge.
 
 Compiling this extensive dataset was a major undertaking, and we are very thankful to the many domain experts who helped to collect and manually annotate the data for this competition. Specifically, we would like to thank (institutions and individual contributors in alphabetic order):
@@ -332,6 +408,5 @@ Photo Credits
 Banner picture of a Hyacinth Macaw by Thomas Fuhrmann. Inset picture of a Jaguar by Leonardo Ramos.
 
 ## Citation
-Stefan Kahl, Tom Denton, Larissa Sugai, Liliana Piatti, Ryan Holbrook, Holger Klinck, and Ashley Oldacre. BirdCLEF+ 2026. [https://kaggle.com/competitions/birdclef-2026](https://kaggle.com/competitions/birdclef-2026), 2026. Kaggle. 
 
-
+Stefan Kahl, Tom Denton, Larissa Sugai, Liliana Piatti, Ryan Holbrook, Holger Klinck, and Ashley Oldacre. BirdCLEF+ 2026. [https://kaggle.com/competitions/birdclef-2026](https://kaggle.com/competitions/birdclef-2026), 2026. Kaggle.
