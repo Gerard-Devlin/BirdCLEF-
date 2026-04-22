@@ -43,24 +43,6 @@ if ONNX_WHL.exists():
     )
     print(f"ONNX Runtime installed from {ONNX_WHL}")
 
-_need_tf_install = False
-try:
-    import tensorflow as _tf_test  # noqa: F401
-except Exception:
-    _need_tf_install = True
-
-if _need_tf_install:
-    ok_tb = maybe_install_wheel("tensorboard-2.20.0-*.whl", "tensorboard-2.20.0")
-    ok_tf = maybe_install_wheel("tensorflow-2.20.0-*.whl", "tensorflow-2.20.0")
-    if ok_tb and ok_tf:
-        print("TF 2.20 installed")
-    else:
-        raise RuntimeError(
-            "TensorFlow is not importable and required wheel files were not found in /kaggle/input."
-        )
-else:
-    print("TensorFlow already available; skip local wheel install")
-
 try:
     import onnxruntime as ort
     _ONNX_AVAILABLE = True
@@ -68,6 +50,34 @@ try:
 except ImportError:
     _ONNX_AVAILABLE = False
     print("ONNX not available, falling back to TF")
+
+_TF_AVAILABLE = False
+try:
+    import tensorflow as _tf_test  # noqa: F401
+    _TF_AVAILABLE = True
+except Exception:
+    _TF_AVAILABLE = False
+
+if not _TF_AVAILABLE:
+    ok_tb = maybe_install_wheel("tensorboard-2.20.0-*.whl", "tensorboard-2.20.0")
+    ok_tf = maybe_install_wheel("tensorflow-2.20.0-*.whl", "tensorflow-2.20.0")
+    if ok_tb and ok_tf:
+        try:
+            import tensorflow as _tf_test  # noqa: F401
+            _TF_AVAILABLE = True
+            print("TF 2.20 installed")
+        except Exception:
+            _TF_AVAILABLE = False
+            print("[WARN] TensorFlow install attempt failed; continuing in ONNX-only mode if possible.")
+    else:
+        print("[WARN] TensorFlow wheels not found; continuing in ONNX-only mode if possible.")
+else:
+    print("TensorFlow already available; skip local wheel install")
+
+if (not _ONNX_AVAILABLE) and (not _TF_AVAILABLE):
+    raise RuntimeError(
+        "Neither ONNX Runtime nor TensorFlow is available. Install at least one backend."
+    )
 
 # ===== Cell 2 =====
 # Toggle between local cross-validation ('train') and Kaggle submission ('submit').
@@ -118,14 +128,21 @@ warnings.filterwarnings("ignore")
 import numpy as np
 import pandas as pd
 import soundfile as sf
-import tensorflow as tf
 from sklearn.metrics import roc_auc_score
 from sklearn.model_selection import GroupKFold
 from tqdm.auto import tqdm
+
+if _TF_AVAILABLE:
+    import tensorflow as tf
+else:
+    tf = None
  
-tf.experimental.numpy.experimental_enable_numpy_behavior()
-try: tf.config.set_visible_devices([], "GPU")
-except: pass
+if _TF_AVAILABLE:
+    tf.experimental.numpy.experimental_enable_numpy_behavior()
+    try:
+        tf.config.set_visible_devices([], "GPU")
+    except Exception:
+        pass
  
 _WALL_START = time.time()
  
@@ -295,12 +312,6 @@ print(f"Classes: {N_CLASSES} | Fully-labeled files: {len(full_files)}")
 print(f"Full-file windows: {len(full_rows)} | Active classes: {int((Y_FULL.sum(0) > 0).sum())}")
 
 # ===== Cell 5 =====
-# Load the Google Perch bird classifier via TF SavedModel, then optionally upgrade
-# to an ONNX session for faster inference. Build mapping arrays that translate
-# Perch output indices to competition label indices.
-birdclassifier = tf.saved_model.load(str(MODEL_DIR))
-infer_fn       = birdclassifier.signatures["serving_default"]
-
 ONNX_PERCH_PATH = Path(
     os.environ.get(
         "BC26_ONNX_PATH",
@@ -308,6 +319,7 @@ ONNX_PERCH_PATH = Path(
     )
 )
 USE_ONNX = _ONNX_AVAILABLE and ONNX_PERCH_PATH.exists()
+infer_fn = None
 
 if USE_ONNX:
     _so = ort.SessionOptions()
@@ -318,6 +330,12 @@ if USE_ONNX:
     ONNX_OUT_MAP    = {o.name: i for i, o in enumerate(ONNX_SESSION.get_outputs())}
     print("Using ONNX Perch (150x faster)")
 else:
+    if not _TF_AVAILABLE:
+        raise RuntimeError(
+            f"ONNX model not found at {ONNX_PERCH_PATH} and TensorFlow is unavailable."
+        )
+    birdclassifier = tf.saved_model.load(str(MODEL_DIR))
+    infer_fn = birdclassifier.signatures["serving_default"]
     print("Using TF SavedModel Perch")
 
 bc_labels = (pd.read_csv(MODEL_DIR / "assets" / "labels.csv")
