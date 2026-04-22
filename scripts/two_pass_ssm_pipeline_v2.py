@@ -220,6 +220,12 @@ TUNE = {
     "proto_epochs": _env_int("BC26_PROTO_EPOCHS", 40),
     "proto_patience": _env_int("BC26_PROTO_PATIENCE", 8),
     "proto_lr": _env_float("BC26_PROTO_LR", 1e-3),
+    "proto_d_model": _env_int("BC26_PROTO_D_MODEL", 128),
+    "proto_d_state": _env_int("BC26_PROTO_D_STATE", 16),
+    "proto_meta_dim": _env_int("BC26_PROTO_META_DIM", 16),
+    "proto_dropout": _env_float("BC26_PROTO_DROPOUT", 0.15),
+    "proto_n_layers": _env_int("BC26_PROTO_N_LAYERS", 2),
+    "proto_cross_attn_heads": _env_int("BC26_PROTO_CROSS_ATTN_HEADS", 2),
     "res_epochs": _env_int("BC26_RES_EPOCHS", 30),
     "res_patience": _env_int("BC26_RES_PATIENCE", 8),
     "res_lr": _env_float("BC26_RES_LR", 1e-3),
@@ -261,6 +267,7 @@ print(f"  SUBMISSION_PATH={SUBMISSION_PATH}")
 print(
     "TUNE: "
     f"proto={TUNE['proto_epochs']}ep/{TUNE['proto_patience']}pat@{TUNE['proto_lr']} "
+    f"(d_model={TUNE['proto_d_model']},d_state={TUNE['proto_d_state']},layers={TUNE['proto_n_layers']},heads={TUNE['proto_cross_attn_heads']}) "
     f"res={TUNE['res_epochs']}ep/{TUNE['res_patience']}pat@{TUNE['res_lr']} "
     f"(d_model={TUNE['res_d_model']},d_state={TUNE['res_d_state']}) "
     f"mlp(min_pos={TUNE['mlp_min_pos']},pca={TUNE['mlp_pca_dim']},alpha={TUNE['mlp_alpha_blend']})"
@@ -1324,12 +1331,14 @@ class LightProtoSSM(nn.Module):
         meta_dim=16,
         use_cross_attn=True,
         cross_attn_heads=2,
+        n_ssm_layers=2,
     ):
         super().__init__()
 
         self.n_classes = n_classes
         self.n_windows = n_windows
         self.use_cross_attn = use_cross_attn
+        self.n_ssm_layers = n_ssm_layers
 
         self.input_proj = nn.Sequential(
             nn.Linear(d_input, d_model),
@@ -1344,16 +1353,16 @@ class LightProtoSSM(nn.Module):
         self.meta_proj = nn.Linear(2 * meta_dim, d_model)
 
         self.ssm_fwd = nn.ModuleList(
-            [SelectiveSSM(d_model, d_state) for _ in range(2)]
+            [SelectiveSSM(d_model, d_state) for _ in range(n_ssm_layers)]
         )
         self.ssm_bwd = nn.ModuleList(
-            [SelectiveSSM(d_model, d_state) for _ in range(2)]
+            [SelectiveSSM(d_model, d_state) for _ in range(n_ssm_layers)]
         )
         self.ssm_merge = nn.ModuleList(
-            [nn.Linear(2 * d_model, d_model) for _ in range(2)]
+            [nn.Linear(2 * d_model, d_model) for _ in range(n_ssm_layers)]
         )
         self.ssm_norm = nn.ModuleList(
-            [nn.LayerNorm(d_model) for _ in range(2)]
+            [nn.LayerNorm(d_model) for _ in range(n_ssm_layers)]
         )
         self.drop = nn.Dropout(dropout)
 
@@ -1366,11 +1375,11 @@ class LightProtoSSM(nn.Module):
                         dropout=dropout,
                         batch_first=True,
                     )
-                    for _ in range(2)
+                    for _ in range(n_ssm_layers)
                 ]
             )
             self.cross_norm = nn.ModuleList(
-                [nn.LayerNorm(d_model) for _ in range(2)]
+                [nn.LayerNorm(d_model) for _ in range(n_ssm_layers)]
             )
 
         self.prototypes = nn.Parameter(
@@ -1451,6 +1460,12 @@ def train_light_proto_ssm(
     n_epochs=40,
     patience=8,
     lr=1e-3,
+    d_model=128,
+    d_state=16,
+    meta_dim=16,
+    dropout=0.15,
+    n_layers=2,
+    cross_attn_heads=2,
     n_sites=20,
     verbose=False,
 ):
@@ -1495,10 +1510,15 @@ def train_light_proto_ssm(
     )
 
     model = LightProtoSSM(
+        d_model=d_model,
+        d_state=d_state,
         n_classes=N_CLASSES,
         n_sites=n_sites,
+        meta_dim=meta_dim,
+        dropout=dropout,
         use_cross_attn=True,
-        cross_attn_heads=2,
+        cross_attn_heads=cross_attn_heads,
+        n_ssm_layers=n_layers,
     ).to(TORCH_DEVICE)
 
     model.init_prototypes(
@@ -1506,7 +1526,11 @@ def train_light_proto_ssm(
         torch.tensor(Y_full, dtype=torch.float32, device=TORCH_DEVICE),
     )
 
-    print(f"LightProtoSSM params: {model.count_parameters():,}")
+    print(
+        f"LightProtoSSM params: {model.count_parameters():,} "
+        f"(d_model={d_model}, d_state={d_state}, meta_dim={meta_dim}, "
+        f"dropout={dropout}, layers={n_layers}, heads={cross_attn_heads})"
+    )
 
     emb_t = torch.tensor(emb_f, dtype=torch.float32, device=TORCH_DEVICE)
     log_t = torch.tensor(log_f, dtype=torch.float32, device=TORCH_DEVICE)
@@ -1889,6 +1913,12 @@ def run_pipeline_oof(emb_full, sc_full, Y_full, meta_full, n_splits=5):
             n_epochs=TUNE["proto_epochs"],
             patience=TUNE["proto_patience"],
             lr=TUNE["proto_lr"],
+            d_model=TUNE["proto_d_model"],
+            d_state=TUNE["proto_d_state"],
+            meta_dim=TUNE["proto_meta_dim"],
+            dropout=TUNE["proto_dropout"],
+            n_layers=TUNE["proto_n_layers"],
+            cross_attn_heads=TUNE["proto_cross_attn_heads"],
             verbose=False,
         )
 
@@ -2061,6 +2091,13 @@ if LOAD_FROM_CKPT:
     temperatures = np.asarray(ckpt["temperatures"], dtype=np.float32)
     PER_CLASS_THRESHOLDS = np.asarray(ckpt["per_class_thresholds"], dtype=np.float32)
     n_sites_cap = int(ckpt.get("n_sites_cap", 20))
+    proto_arch = ckpt.get("proto_arch", {})
+    proto_d_model = int(proto_arch.get("d_model", 128))
+    proto_d_state = int(proto_arch.get("d_state", 16))
+    proto_meta_dim = int(proto_arch.get("meta_dim", 16))
+    proto_dropout = float(proto_arch.get("dropout", 0.15))
+    proto_n_layers = int(proto_arch.get("n_layers", 2))
+    proto_cross_attn_heads = int(proto_arch.get("cross_attn_heads", 2))
     res_arch = ckpt.get("res_arch", {})
     res_d_model = int(res_arch.get("d_model", 64))
     res_d_state = int(res_arch.get("d_state", 8))
@@ -2068,10 +2105,15 @@ if LOAD_FROM_CKPT:
     res_dropout = float(res_arch.get("dropout", 0.1))
 
     proto_model = LightProtoSSM(
+        d_model=proto_d_model,
+        d_state=proto_d_state,
         n_classes=N_CLASSES,
         n_sites=n_sites_cap,
+        meta_dim=proto_meta_dim,
+        dropout=proto_dropout,
         use_cross_attn=True,
-        cross_attn_heads=2,
+        cross_attn_heads=proto_cross_attn_heads,
+        n_ssm_layers=proto_n_layers,
     ).to(TORCH_DEVICE)
     proto_sd = _sanitize_torch_state_dict(ckpt["proto_state_dict"])
     proto_model.load_state_dict(proto_sd, strict=True)
@@ -2092,6 +2134,7 @@ if LOAD_FROM_CKPT:
     print(
         f"Checkpoint loaded: probes={len(probe_models)} "
         f"| n_sites_cap={n_sites_cap} | alpha_blend={alpha_blend:.3f} "
+        f"| proto_arch(d_model={proto_d_model},d_state={proto_d_state},layers={proto_n_layers},heads={proto_cross_attn_heads}) "
         f"| res_arch(d_model={res_d_model},d_state={res_d_state})"
     )
 else:
@@ -2101,6 +2144,12 @@ else:
         n_epochs=TUNE["proto_epochs"],
         patience=TUNE["proto_patience"],
         lr=TUNE["proto_lr"],
+        d_model=TUNE["proto_d_model"],
+        d_state=TUNE["proto_d_state"],
+        meta_dim=TUNE["proto_meta_dim"],
+        dropout=TUNE["proto_dropout"],
+        n_layers=TUNE["proto_n_layers"],
+        cross_attn_heads=TUNE["proto_cross_attn_heads"],
         verbose=False,
     )
     print(f"ProtoSSM training: {time.time()-t0:.1f}s")
@@ -2185,6 +2234,14 @@ else:
                 "n_sites_cap": n_sites_cap,
                 "site2i_tr": site2i_tr,
                 "proto_state_dict": proto_model.state_dict(),
+                "proto_arch": {
+                    "d_model": int(TUNE["proto_d_model"]),
+                    "d_state": int(TUNE["proto_d_state"]),
+                    "meta_dim": int(TUNE["proto_meta_dim"]),
+                    "dropout": float(TUNE["proto_dropout"]),
+                    "n_layers": int(TUNE["proto_n_layers"]),
+                    "cross_attn_heads": int(TUNE["proto_cross_attn_heads"]),
+                },
                 "residual_state_dict": res_model.state_dict(),
                 "res_arch": {
                     "d_model": int(TUNE["res_d_model"]),
