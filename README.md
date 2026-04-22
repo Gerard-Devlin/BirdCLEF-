@@ -35,6 +35,17 @@ You need these assets:
 - `BC26_SUBMISSION_PATH`: output CSV path (default `submission.csv`)
 - `BC26_ONNX_PATH`: optional ONNX model path
 - `BC26_EXTRA_CACHE_DIRS`: extra cache dirs separated by `:` on Linux or `;` on Windows
+- `BC26_CKPT_PATH`: optional pipeline ckpt path (save when training, load when exists)
+
+### Optional Tunables (env vars)
+
+- `BC26_PROTO_EPOCHS`, `BC26_PROTO_PATIENCE`, `BC26_PROTO_LR`
+- `BC26_RES_EPOCHS`, `BC26_RES_PATIENCE`, `BC26_RES_LR`, `BC26_RES_CORRECTION_WEIGHT`
+- `BC26_MLP_MIN_POS`, `BC26_MLP_PCA_DIM`, `BC26_MLP_ALPHA_BLEND`
+- `BC26_PRIOR_LAMBDA`, `BC26_ENSEMBLE_W`
+- `BC26_TTA_SHIFTS` (comma-separated, e.g. `0,1,-1,2,-2`)
+- `BC26_THRESHOLD_GRID` (comma-separated, e.g. `0.25,0.30,0.35,0.40,0.45,0.50,0.55,0.60,0.65,0.70`)
+- `BC26_POST_TOPK`, `BC26_POST_CONF_POWER`, `BC26_POST_RANK_POWER`, `BC26_POST_SMOOTH_ALPHA`
 
 ## Local Fine-Tune + Export CKPT (Linux)
 

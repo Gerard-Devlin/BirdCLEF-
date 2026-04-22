@@ -78,6 +78,36 @@ MODE = os.environ.get("BC26_MODE", "submit").strip().lower()
 assert MODE in {"train", "submit"}
 print("MODE =", MODE)
 
+
+def _env_int(name, default):
+    raw = os.environ.get(name, "").strip()
+    if raw == "":
+        return int(default)
+    return int(raw)
+
+
+def _env_float(name, default):
+    raw = os.environ.get(name, "").strip()
+    if raw == "":
+        return float(default)
+    return float(raw)
+
+
+def _env_int_list(name, default):
+    raw = os.environ.get(name, "").strip()
+    if raw == "":
+        return list(default)
+    vals = [int(x.strip()) for x in raw.split(",") if x.strip() != ""]
+    return vals if vals else list(default)
+
+
+def _env_float_list(name, default):
+    raw = os.environ.get(name, "").strip()
+    if raw == "":
+        return list(default)
+    vals = [float(x.strip()) for x in raw.split(",") if x.strip() != ""]
+    return vals if vals else list(default)
+
 # ===== Cell 3 =====
 # Core imports, environment setup, path constants, audio parameters, and the main CFG dict.
 # CFG values are conditional on MODE so the same notebook runs for both CV and submission.
@@ -159,6 +189,31 @@ CFG = {
         "alpha": 0.005,
     },
 }
+
+TUNE = {
+    "proto_epochs": _env_int("BC26_PROTO_EPOCHS", 40),
+    "proto_patience": _env_int("BC26_PROTO_PATIENCE", 8),
+    "proto_lr": _env_float("BC26_PROTO_LR", 1e-3),
+    "res_epochs": _env_int("BC26_RES_EPOCHS", 30),
+    "res_patience": _env_int("BC26_RES_PATIENCE", 8),
+    "res_lr": _env_float("BC26_RES_LR", 1e-3),
+    "res_correction_weight": _env_float("BC26_RES_CORRECTION_WEIGHT", 0.30),
+    "mlp_min_pos": _env_int("BC26_MLP_MIN_POS", 5),
+    "mlp_pca_dim": _env_int("BC26_MLP_PCA_DIM", 64),
+    "mlp_alpha_blend": _env_float("BC26_MLP_ALPHA_BLEND", 0.4),
+    "prior_lambda": _env_float("BC26_PRIOR_LAMBDA", 0.4),
+    "ensemble_w": _env_float("BC26_ENSEMBLE_W", 0.5),
+    "tta_shifts": _env_int_list("BC26_TTA_SHIFTS", [0, 1, -1, 2, -2]),
+    "threshold_grid": _env_float_list(
+        "BC26_THRESHOLD_GRID",
+        [0.25, 0.30, 0.35, 0.40, 0.45, 0.50, 0.55, 0.60, 0.65, 0.70],
+    ),
+    "post_topk": _env_int("BC26_POST_TOPK", 2),
+    "post_conf_power": _env_float("BC26_POST_CONF_POWER", 0.4),
+    "post_rank_power": _env_float("BC26_POST_RANK_POWER", 0.4),
+    "post_smooth_alpha": _env_float("BC26_POST_SMOOTH_ALPHA", 0.20),
+}
+
 print("V18 CFG loaded")
 print(f"  n_epochs={CFG['proto_ssm_train']['n_epochs']}  "
       f"patience={CFG['proto_ssm_train']['patience']}  "
@@ -171,6 +226,12 @@ print(f"  BASE={BASE}")
 print(f"  MODEL_DIR={MODEL_DIR}")
 print(f"  WORK_DIR={WORK_DIR}")
 print(f"  SUBMISSION_PATH={SUBMISSION_PATH}")
+print(
+    "TUNE: "
+    f"proto={TUNE['proto_epochs']}ep/{TUNE['proto_patience']}pat@{TUNE['proto_lr']} "
+    f"res={TUNE['res_epochs']}ep/{TUNE['res_patience']}pat@{TUNE['res_lr']} "
+    f"mlp(min_pos={TUNE['mlp_min_pos']},pca={TUNE['mlp_pca_dim']},alpha={TUNE['mlp_alpha_blend']})"
+)
 
 # ===== Cell 4 =====
 # Load competition CSVs and derive per-window label arrays.
@@ -1748,9 +1809,9 @@ def run_pipeline_oof(emb_full, sc_full, Y_full, meta_full, n_splits=5):
             sc_tr_f,
             Y_tr_f,
             meta_tr_f,
-            n_epochs=40,
-            patience=8,
-            lr=1e-3,
+            n_epochs=TUNE["proto_epochs"],
+            patience=TUNE["proto_patience"],
+            lr=TUNE["proto_lr"],
             verbose=False,
         )
 
@@ -1808,9 +1869,9 @@ def run_pipeline_oof(emb_full, sc_full, Y_full, meta_full, n_splits=5):
             emb_tr_f,
             sc_tr_f,
             Y_tr_f,
-            min_pos=5,
-            pca_dim=64,
-            alpha_blend=0.4,
+            min_pos=TUNE["mlp_min_pos"],
+            pca_dim=TUNE["mlp_pca_dim"],
+            alpha_blend=TUNE["mlp_alpha_blend"],
         )
 
         sc_va_mlp = apply_mlp_probes_vectorized(
@@ -1822,7 +1883,7 @@ def run_pipeline_oof(emb_full, sc_full, Y_full, meta_full, n_splits=5):
             alpha_blend,
         )
 
-        first_pass = 0.5 * proto_va + 0.5 * sc_va_mlp
+        first_pass = TUNE["ensemble_w"] * proto_va + (1.0 - TUNE["ensemble_w"]) * sc_va_mlp
         probs_va = 1.0 / (1.0 + np.exp(-np.clip(first_pass, -30, 30)))
         oof_probs[va_mask] = probs_va
 
@@ -1882,7 +1943,7 @@ LOAD_FROM_CKPT = bool(CKPT_PATH is not None and CKPT_PATH.exists())
 SAVE_TO_CKPT = bool(CKPT_PATH is not None)
 
 n_sites_cap = 20
-ENSEMBLE_W = 0.5
+ENSEMBLE_W = float(TUNE["ensemble_w"])
 
 if LOAD_FROM_CKPT:
     print(f"Loading pipeline checkpoint: {CKPT_PATH}")
@@ -1898,9 +1959,9 @@ if LOAD_FROM_CKPT:
     probe_models = ckpt["probe_models"]
     emb_scaler = ckpt["emb_scaler"]
     emb_pca = ckpt["emb_pca"]
-    alpha_blend = float(ckpt.get("alpha_blend", 0.4))
-    ENSEMBLE_W = float(ckpt.get("ensemble_w", 0.5))
-    correction_weight = float(ckpt.get("correction_weight", 0.30))
+    alpha_blend = float(ckpt.get("alpha_blend", TUNE["mlp_alpha_blend"]))
+    ENSEMBLE_W = float(ckpt.get("ensemble_w", TUNE["ensemble_w"]))
+    correction_weight = float(ckpt.get("correction_weight", TUNE["res_correction_weight"]))
     temperatures = np.asarray(ckpt["temperatures"], dtype=np.float32)
     PER_CLASS_THRESHOLDS = np.asarray(ckpt["per_class_thresholds"], dtype=np.float32)
     n_sites_cap = int(ckpt.get("n_sites_cap", 20))
@@ -1926,13 +1987,19 @@ else:
     t0 = time.time()
     proto_model, site2i_tr = train_light_proto_ssm(
         emb_tr, sc_tr, Y_FULL_aligned, meta_tr,
-        n_epochs=40, patience=8, lr=1e-3, verbose=False)
+        n_epochs=TUNE["proto_epochs"],
+        patience=TUNE["proto_patience"],
+        lr=TUNE["proto_lr"],
+        verbose=False,
+    )
     print(f"ProtoSSM training: {time.time()-t0:.1f}s")
 
     prior_tables = build_prior_tables(sc, Y_SC)
     probe_models, emb_scaler, emb_pca, alpha_blend = train_mlp_probes(
         emb=emb_tr, scores_raw=sc_tr, Y=Y_FULL_aligned,
-        min_pos=5, pca_dim=64, alpha_blend=0.4,
+        min_pos=TUNE["mlp_min_pos"],
+        pca_dim=TUNE["mlp_pca_dim"],
+        alpha_blend=TUNE["mlp_alpha_blend"],
     )
 
     n_tr_files    = len(sc_tr) // N_WINDOWS
@@ -1953,7 +2020,7 @@ else:
         proto_model, emb_tr_f, sc_tr_f,
         site_t=torch.tensor(tr_site_ids, dtype=torch.long),
         hour_t=torch.tensor(tr_hour_ids, dtype=torch.long),
-        shifts=[0, 1, -1, 2, -2],
+        shifts=TUNE["tta_shifts"],
     )
     proto_tr_flat = proto_tr_out.reshape(-1, N_CLASSES).astype(np.float32)
 
@@ -1962,7 +2029,7 @@ else:
         sites=meta_tr["site"].to_numpy(),
         hours=meta_tr["hour_utc"].to_numpy(),
         tables=prior_tables,
-        lambda_prior=0.4,
+        lambda_prior=TUNE["prior_lambda"],
     )
     sc_tr_mlp = apply_mlp_probes_vectorized(
         emb_tr, sc_tr_prior,
@@ -1975,7 +2042,7 @@ else:
     PER_CLASS_THRESHOLDS = calibrate_and_optimize_thresholds(
         oof_probs=train_probs_for_calib,
         Y_FULL=Y_FULL_aligned,
-        threshold_grid=[0.25, 0.30, 0.35, 0.40, 0.45, 0.50, 0.55, 0.60, 0.65, 0.70],
+        threshold_grid=TUNE["threshold_grid"],
         n_windows=N_WINDOWS,
     )
 
@@ -1986,10 +2053,10 @@ else:
         Y_full=Y_FULL_aligned,
         site_ids=tr_site_ids,
         hour_ids=tr_hour_ids,
-        n_epochs=30,
-        patience=8,
-        lr=1e-3,
-        correction_weight=0.30,
+        n_epochs=TUNE["res_epochs"],
+        patience=TUNE["res_patience"],
+        lr=TUNE["res_lr"],
+        correction_weight=TUNE["res_correction_weight"],
         verbose=False,
     )
     print(f"ResidualSSM training: {time.time()-t0:.1f}s")
@@ -2013,6 +2080,7 @@ else:
                 "correction_weight": float(correction_weight),
                 "temperatures": temperatures.astype(np.float32),
                 "per_class_thresholds": PER_CLASS_THRESHOLDS.astype(np.float32),
+                "tune": dict(TUNE),
             },
             CKPT_PATH,
         )
@@ -2047,7 +2115,7 @@ sc_te_adjusted = apply_prior(
     sites=meta_te["site"].to_numpy(),
     hours=meta_te["hour_utc"].to_numpy(),
     tables=prior_tables,
-    lambda_prior=0.4,
+    lambda_prior=TUNE["prior_lambda"],
 )
 sc_te_adjusted = apply_mlp_probes_vectorized(
     emb_te, sc_te_adjusted,
@@ -2079,11 +2147,11 @@ final_scores = final_scores / temperatures[None, :]
 probs = sigmoid(final_scores)
 
 probs = file_confidence_scale(probs, n_windows=N_WINDOWS,
-                               top_k=2,       power=0.4)
+                               top_k=TUNE["post_topk"], power=TUNE["post_conf_power"])
 probs = rank_aware_scaling(   probs, n_windows=N_WINDOWS,
-                               power=0.4)
+                               power=TUNE["post_rank_power"])
 probs = adaptive_delta_smooth(probs, n_windows=N_WINDOWS,
-                               base_alpha=0.20)
+                               base_alpha=TUNE["post_smooth_alpha"])
 probs = np.clip(probs, 0.0, 1.0)
 
 probs = apply_per_class_thresholds(probs, PER_CLASS_THRESHOLDS)
