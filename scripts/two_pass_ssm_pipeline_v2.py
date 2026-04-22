@@ -130,7 +130,7 @@ def _env_bool(name, default=False):
 # ===== Cell 3 =====
 # Core imports, environment setup, path constants, audio parameters, and the main CFG dict.
 # CFG values are conditional on MODE so the same notebook runs for both CV and submission.
-import os, re, gc, time, warnings
+import os, re, gc, time, warnings, random
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 warnings.filterwarnings("ignore")
  
@@ -251,12 +251,18 @@ TUNE = {
 }
 
 DISABLE_EARLY_STOP = _env_bool("BC26_DISABLE_EARLY_STOP", False)
+GLOBAL_SEED = _env_int("BC26_SEED", 42)
+
+np.random.seed(GLOBAL_SEED)
+random.seed(GLOBAL_SEED)
+CFG["mlp_params"]["random_state"] = GLOBAL_SEED
 
 print("V18 CFG loaded")
 print(f"  n_epochs={CFG['proto_ssm_train']['n_epochs']}  "
       f"patience={CFG['proto_ssm_train']['patience']}  "
       f"oof_n_splits={CFG['proto_ssm_train']['oof_n_splits']}  "
       f"mlp_max_iter={CFG['mlp_params']['max_iter']}")
+print(f"  seed={GLOBAL_SEED}")
  
 print("Config ready")
 print(f"  run_oof={CFG['run_oof']}  verbose={CFG['verbose']}  dryrun={CFG['dryrun_n_files']}")
@@ -963,7 +969,7 @@ def train_mlp_probes(emb, scores_raw, Y, min_pos=5, pca_dim=64, alpha_blend=0.4)
             early_stopping=True,
             validation_fraction=0.15,
             n_iter_no_change=15,
-            random_state=42,
+            random_state=GLOBAL_SEED,
             learning_rate_init=5e-4,
             alpha=0.005,
         )
@@ -997,6 +1003,10 @@ print("[OK] CHANGE 1: Upgraded MLP probe (pca_dim=64, hidden=(128,64), max_iter=
 # Replaces the per-class Python loop at inference time for a 10-50x speedup.
 import torch
 import torch.nn as nn
+
+torch.manual_seed(GLOBAL_SEED)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(GLOBAL_SEED)
 
 TORCH_DEVICE = torch.device(
     "cuda" if (USE_GPU and torch.cuda.is_available()) else "cpu"
@@ -1767,7 +1777,7 @@ def train_residual_ssm(emb_full, first_pass_flat, Y_full,
           f"abs_mean={np.abs(residuals).mean():.4f}")
 
     n_val    = max(1, int(n_files * 0.15))
-    rng      = torch.Generator(); rng.manual_seed(42)
+    rng      = torch.Generator(); rng.manual_seed(GLOBAL_SEED)
     perm     = torch.randperm(n_files, generator=rng).numpy()
     val_i    = perm[:n_val];  train_i = perm[n_val:]
 
