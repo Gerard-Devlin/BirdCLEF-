@@ -45,10 +45,14 @@ logs/
 *.onnx
 *.npz
 *.npy
+._*
+.__
 
 # Competition / dataset files
 dataset/
+models/
+source/Perch_meta/
+source/Perch-onnx-for-birdclef+2026/
 
 # Kaggle packaging artifacts
 kaggle_bundle/
-
