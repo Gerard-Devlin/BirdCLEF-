@@ -223,6 +223,10 @@ TUNE = {
     "res_epochs": _env_int("BC26_RES_EPOCHS", 30),
     "res_patience": _env_int("BC26_RES_PATIENCE", 8),
     "res_lr": _env_float("BC26_RES_LR", 1e-3),
+    "res_d_model": _env_int("BC26_RES_D_MODEL", 64),
+    "res_d_state": _env_int("BC26_RES_D_STATE", 8),
+    "res_meta_dim": _env_int("BC26_RES_META_DIM", 8),
+    "res_dropout": _env_float("BC26_RES_DROPOUT", 0.1),
     "res_correction_weight": _env_float("BC26_RES_CORRECTION_WEIGHT", 0.30),
     "mlp_min_pos": _env_int("BC26_MLP_MIN_POS", 5),
     "mlp_pca_dim": _env_int("BC26_MLP_PCA_DIM", 64),
@@ -258,6 +262,7 @@ print(
     "TUNE: "
     f"proto={TUNE['proto_epochs']}ep/{TUNE['proto_patience']}pat@{TUNE['proto_lr']} "
     f"res={TUNE['res_epochs']}ep/{TUNE['res_patience']}pat@{TUNE['res_lr']} "
+    f"(d_model={TUNE['res_d_model']},d_state={TUNE['res_d_state']}) "
     f"mlp(min_pos={TUNE['mlp_min_pos']},pca={TUNE['mlp_pca_dim']},alpha={TUNE['mlp_alpha_blend']})"
 )
 if DISABLE_EARLY_STOP:
@@ -1717,6 +1722,7 @@ class ResidualSSM(nn.Module):
 def train_residual_ssm(emb_full, first_pass_flat, Y_full,
                        site_ids, hour_ids,
                        n_epochs=30, patience=8, lr=1e-3,
+                       d_model=64, d_state=8, meta_dim=8, dropout=0.1,
                        correction_weight=0.30,
                        verbose=False):
     """
@@ -1747,8 +1753,18 @@ def train_residual_ssm(emb_full, first_pass_flat, Y_full,
     site_t   = torch.tensor(site_ids, dtype=torch.long, device=TORCH_DEVICE)
     hour_t   = torch.tensor(hour_ids, dtype=torch.long, device=TORCH_DEVICE)
 
-    model    = ResidualSSM(n_classes=N_CLASSES, n_sites=20).to(TORCH_DEVICE)
-    print(f"ResidualSSM params: {model.count_parameters():,}")
+    model = ResidualSSM(
+        n_classes=N_CLASSES,
+        n_sites=20,
+        d_model=d_model,
+        d_state=d_state,
+        meta_dim=meta_dim,
+        dropout=dropout,
+    ).to(TORCH_DEVICE)
+    print(
+        f"ResidualSSM params: {model.count_parameters():,} "
+        f"(d_model={d_model}, d_state={d_state}, meta_dim={meta_dim}, dropout={dropout})"
+    )
 
     opt      = torch.optim.AdamW(
         model.parameters(), lr=lr, weight_decay=1e-3)
@@ -2045,6 +2061,11 @@ if LOAD_FROM_CKPT:
     temperatures = np.asarray(ckpt["temperatures"], dtype=np.float32)
     PER_CLASS_THRESHOLDS = np.asarray(ckpt["per_class_thresholds"], dtype=np.float32)
     n_sites_cap = int(ckpt.get("n_sites_cap", 20))
+    res_arch = ckpt.get("res_arch", {})
+    res_d_model = int(res_arch.get("d_model", 64))
+    res_d_state = int(res_arch.get("d_state", 8))
+    res_meta_dim = int(res_arch.get("meta_dim", 8))
+    res_dropout = float(res_arch.get("dropout", 0.1))
 
     proto_model = LightProtoSSM(
         n_classes=N_CLASSES,
@@ -2056,14 +2077,22 @@ if LOAD_FROM_CKPT:
     proto_model.load_state_dict(proto_sd, strict=True)
     proto_model.eval()
 
-    res_model = ResidualSSM(n_classes=N_CLASSES, n_sites=n_sites_cap).to(TORCH_DEVICE)
+    res_model = ResidualSSM(
+        n_classes=N_CLASSES,
+        n_sites=n_sites_cap,
+        d_model=res_d_model,
+        d_state=res_d_state,
+        meta_dim=res_meta_dim,
+        dropout=res_dropout,
+    ).to(TORCH_DEVICE)
     res_sd = _sanitize_torch_state_dict(ckpt["residual_state_dict"])
     res_model.load_state_dict(res_sd, strict=True)
     res_model.eval()
 
     print(
         f"Checkpoint loaded: probes={len(probe_models)} "
-        f"| n_sites_cap={n_sites_cap} | alpha_blend={alpha_blend:.3f}"
+        f"| n_sites_cap={n_sites_cap} | alpha_blend={alpha_blend:.3f} "
+        f"| res_arch(d_model={res_d_model},d_state={res_d_state})"
     )
 else:
     t0 = time.time()
@@ -2138,6 +2167,10 @@ else:
         n_epochs=TUNE["res_epochs"],
         patience=TUNE["res_patience"],
         lr=TUNE["res_lr"],
+        d_model=TUNE["res_d_model"],
+        d_state=TUNE["res_d_state"],
+        meta_dim=TUNE["res_meta_dim"],
+        dropout=TUNE["res_dropout"],
         correction_weight=TUNE["res_correction_weight"],
         verbose=False,
     )
@@ -2153,6 +2186,12 @@ else:
                 "site2i_tr": site2i_tr,
                 "proto_state_dict": proto_model.state_dict(),
                 "residual_state_dict": res_model.state_dict(),
+                "res_arch": {
+                    "d_model": int(TUNE["res_d_model"]),
+                    "d_state": int(TUNE["res_d_state"]),
+                    "meta_dim": int(TUNE["res_meta_dim"]),
+                    "dropout": float(TUNE["res_dropout"]),
+                },
                 "prior_tables": prior_tables,
                 "probe_models": probe_models,
                 "emb_scaler": emb_scaler,

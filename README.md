@@ -42,6 +42,7 @@ You need these assets:
 
 - `BC26_PROTO_EPOCHS`, `BC26_PROTO_PATIENCE`, `BC26_PROTO_LR`
 - `BC26_RES_EPOCHS`, `BC26_RES_PATIENCE`, `BC26_RES_LR`, `BC26_RES_CORRECTION_WEIGHT`
+- `BC26_RES_D_MODEL`, `BC26_RES_D_STATE`, `BC26_RES_META_DIM`, `BC26_RES_DROPOUT`
 - `BC26_MLP_MIN_POS`, `BC26_MLP_PCA_DIM`, `BC26_MLP_ALPHA_BLEND`
 - `BC26_PRIOR_LAMBDA`, `BC26_ENSEMBLE_W`
 - `BC26_TTA_SHIFTS` (comma-separated, e.g. `0,1,-1,2,-2`)
@@ -68,7 +69,7 @@ After this run, `BC26_CKPT_PATH` is your offline fine-tuned checkpoint bundle.
 
 ## Server Training Command (nohup)
 
-Use this exact command on server:
+Use this template command on server:
 
 ```bash
 cd ~/birdclef+
@@ -76,17 +77,20 @@ conda activate birdclef
 ROOT="$PWD"
 mkdir -p "$ROOT/logs" "$ROOT/work/cache" "$ROOT/work/ckpt"
 
-CKPT="$ROOT/work/ckpt/two_pass_pipeline_ckpt_v2.pth"
+RUN_TAG="v5"
+CKPT="$ROOT/work/ckpt/two_pass_pipeline_ckpt_${RUN_TAG}.pth"
 nohup env PYTHONNOUSERSITE=1 \
 BC26_USE_GPU=1 \
 BC26_MODE=train \
 BC26_BASE="$ROOT/dataset" \
 BC26_MODEL_DIR="$ROOT/models/bird-vocalization-classifier-tensorflow2-perch_v2_cpu-v1" \
 BC26_WORK_DIR="$ROOT/work/cache" \
-BC26_SUBMISSION_PATH="$ROOT/work/submission_local_v2.csv" \
+BC26_SUBMISSION_PATH="$ROOT/work/submission_local_${RUN_TAG}.csv" \
 BC26_ONNX_PATH="$ROOT/source/Perch-onnx-for-birdclef+2026/perch_v2.onnx" \
 BC26_EXTRA_CACHE_DIRS="$ROOT/source/Perch_meta" \
 BC26_CKPT_PATH="$CKPT" \
+BC26_LOAD_CKPT_IN_TRAIN=0 \
+BC26_DISABLE_EARLY_STOP=0 \
 BC26_PROTO_EPOCHS=80 \
 BC26_PROTO_PATIENCE=16 \
 BC26_PROTO_LR=8e-4 \
@@ -94,17 +98,17 @@ BC26_RES_EPOCHS=60 \
 BC26_RES_PATIENCE=14 \
 BC26_RES_LR=8e-4 \
 BC26_MLP_MIN_POS=3 \
-python scripts/two_pass_ssm_pipeline_v2.py > "$ROOT/logs/train_ckpt_v2.log" 2>&1 &
+python scripts/two_pass_ssm_pipeline_v2.py > "$ROOT/logs/train_ckpt_${RUN_TAG}.log" 2>&1 &
 
-echo $! > "$ROOT/logs/train_ckpt_v2.pid"
-tail -f "$ROOT/logs/train_ckpt_v2.log"
+echo $! > "$ROOT/logs/train_ckpt_${RUN_TAG}.pid"
+tail -f "$ROOT/logs/train_ckpt_${RUN_TAG}.log"
 ```
 
 Completion signals:
 
 - `Full pipeline OOF AUC: ...`
 - `Pipeline checkpoint saved to: ...`
-- `submission_local_v2.csv saved ...`
+- `submission_local_${RUN_TAG}.csv saved ...`
 
 Common issues:
 
@@ -113,6 +117,33 @@ Common issues:
 - `cuda:0 and cpu mismatch`: pull latest code (`git pull`) and rerun.
 - If `BC26_CKPT_PATH` already exists, `BC26_MODE=train` now ignores loading it by default and only saves new ckpt at the end.  
   To force loading ckpt during train mode, set `BC26_LOAD_CKPT_IN_TRAIN=1`.
+
+## Build Kaggle Input Bundle (Server)
+
+After training, package `scripts + ckpt` into one tarball for Kaggle Dataset upload.
+
+```bash
+cd ~/birdclef+
+ROOT="$PWD"
+
+# Change these two values per run
+BUNDLE_TAG="kaggle_bundle_v5"
+CKPT_SRC="$ROOT/work/ckpt/two_pass_pipeline_ckpt_v5.pth"
+
+BUNDLE_DIR="$ROOT/build/$BUNDLE_TAG"
+TAR_PATH="$ROOT/build/${BUNDLE_TAG}.tar.gz"
+
+rm -rf "$BUNDLE_DIR"
+mkdir -p "$BUNDLE_DIR/scripts"
+
+cp "$ROOT/scripts/infer_pt.py" "$BUNDLE_DIR/scripts/"
+cp "$ROOT/scripts/two_pass_ssm_pipeline_v2.py" "$BUNDLE_DIR/scripts/"
+cp "$CKPT_SRC" "$BUNDLE_DIR/checkpoint.pth"
+
+tar -czf "$TAR_PATH" -C "$ROOT/build" "$BUNDLE_TAG"
+ls -lh "$TAR_PATH"
+tar -tzf "$TAR_PATH" | head
+```
 
 ## Kaggle Pure Inference (No Fine-Tune)
 
@@ -124,7 +155,7 @@ Notebook Cell 1 (path setup):
 import os
 
 bundle_root = "/kaggle/input/<your-code-dataset-root>"
-ckpt_path = "/kaggle/input/<your-ckpt-dataset-root>/two_pass_pipeline_ckpt.pth"
+ckpt_path = f"{bundle_root}/checkpoint.pth"
 base = "/kaggle/input/competitions/birdclef-2026"
 model_dir = "/kaggle/input/models/google/bird-vocalization-classifier/tensorflow2/perch_v2_cpu/1"
 onnx_path = "/kaggle/input/perch-onnx-for-birdclef+2026/perch_v2.onnx"
