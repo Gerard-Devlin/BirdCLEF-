@@ -120,6 +120,13 @@ def _env_float_list(name, default):
     vals = [float(x.strip()) for x in raw.split(",") if x.strip() != ""]
     return vals if vals else list(default)
 
+
+def _env_bool(name, default=False):
+    raw = os.environ.get(name, "").strip().lower()
+    if raw == "":
+        return bool(default)
+    return raw in {"1", "true", "yes", "y", "on"}
+
 # ===== Cell 3 =====
 # Core imports, environment setup, path constants, audio parameters, and the main CFG dict.
 # CFG values are conditional on MODE so the same notebook runs for both CV and submission.
@@ -233,6 +240,8 @@ TUNE = {
     "post_smooth_alpha": _env_float("BC26_POST_SMOOTH_ALPHA", 0.20),
 }
 
+DISABLE_EARLY_STOP = _env_bool("BC26_DISABLE_EARLY_STOP", False)
+
 print("V18 CFG loaded")
 print(f"  n_epochs={CFG['proto_ssm_train']['n_epochs']}  "
       f"patience={CFG['proto_ssm_train']['patience']}  "
@@ -251,6 +260,8 @@ print(
     f"res={TUNE['res_epochs']}ep/{TUNE['res_patience']}pat@{TUNE['res_lr']} "
     f"mlp(min_pos={TUNE['mlp_min_pos']},pca={TUNE['mlp_pca_dim']},alpha={TUNE['mlp_alpha_blend']})"
 )
+if DISABLE_EARLY_STOP:
+    print("TUNE: early stopping disabled via BC26_DISABLE_EARLY_STOP=1")
 
 # ===== Cell 4 =====
 # Load competition CSVs and derive per-window label arrays.
@@ -1513,12 +1524,16 @@ def train_light_proto_ssm(
     )
 
     best_loss, best_state, wait = float("inf"), None, 0
+    effective_patience = n_epochs + 1 if DISABLE_EARLY_STOP else patience
+    early_stopped = False
+    epochs_ran = 0
 
     swa_model = torch.optim.swa_utils.AveragedModel(model)
     swa_start = int(n_epochs * 0.65)
     swa_sched = torch.optim.swa_utils.SWALR(opt, swa_lr=4e-4)
 
     for ep in range(n_epochs):
+        epochs_ran = ep + 1
         model.train()
 
         out = model(emb_t, log_t, site_ids=site_t, hours=hour_t)
@@ -1550,9 +1565,10 @@ def train_light_proto_ssm(
         else:
             wait += 1
 
-        if wait >= patience:
+        if wait >= effective_patience:
             if verbose:
                 print(f"  Early stop ep {ep+1}")
+            early_stopped = True
             break
 
     if ep >= swa_start:
@@ -1565,7 +1581,10 @@ def train_light_proto_ssm(
     with torch.no_grad():
         out = model(emb_t, log_t, site_ids=site_t, hours=hour_t)
 
-    print(f"LightProtoSSM trained -best loss={best_loss:.4f}")
+    print(
+        f"LightProtoSSM trained -best loss={best_loss:.4f} "
+        f"| epochs_ran={epochs_ran}/{n_epochs} | early_stop={early_stopped}"
+    )
     return model, site2i
 
 
@@ -1738,8 +1757,12 @@ def train_residual_ssm(emb_full, first_pass_flat, Y_full,
         pct_start=0.1, anneal_strategy="cos")
 
     best_loss, best_state, wait = float("inf"), None, 0
+    effective_patience = n_epochs + 1 if DISABLE_EARLY_STOP else patience
+    early_stopped = False
+    epochs_ran = 0
 
     for ep in range(n_epochs):
+        epochs_ran = ep + 1
         model.train()
         corr = model(emb_t[train_i], fp_t[train_i],
                      site_ids=site_t[train_i],
@@ -1763,12 +1786,16 @@ def train_residual_ssm(emb_full, first_pass_flat, Y_full,
             wait = 0
         else:
             wait += 1
-        if wait >= patience:
+        if wait >= effective_patience:
             if verbose: print(f"  Early stop ep {ep+1}")
+            early_stopped = True
             break
 
     model.load_state_dict(best_state)
-    print(f"ResidualSSM trained -best val MSE={best_loss:.6f}")
+    print(
+        f"ResidualSSM trained -best val MSE={best_loss:.6f} "
+        f"| epochs_ran={epochs_ran}/{n_epochs} | early_stop={early_stopped}"
+    )
 
     model.eval()
     with torch.no_grad():

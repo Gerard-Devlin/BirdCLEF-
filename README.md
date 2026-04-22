@@ -47,6 +47,7 @@ You need these assets:
 - `BC26_TTA_SHIFTS` (comma-separated, e.g. `0,1,-1,2,-2`)
 - `BC26_THRESHOLD_GRID` (comma-separated, e.g. `0.25,0.30,0.35,0.40,0.45,0.50,0.55,0.60,0.65,0.70`)
 - `BC26_POST_TOPK`, `BC26_POST_CONF_POWER`, `BC26_POST_RANK_POWER`, `BC26_POST_SMOOTH_ALPHA`
+- `BC26_DISABLE_EARLY_STOP` (`1` to disable early stopping and run full epochs)
 
 ## Local Fine-Tune + Export CKPT (Linux)
 
