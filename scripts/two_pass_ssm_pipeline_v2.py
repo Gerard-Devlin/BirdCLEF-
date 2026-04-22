@@ -1278,7 +1278,7 @@ class SelectiveSSM(nn.Module):
         B = self.B_proj(x_conv)
         C = self.C_proj(x_conv)
 
-        h = torch.zeros(B_sz, D, self.d_state)
+        h = torch.zeros(B_sz, D, self.d_state, device=x.device, dtype=x.dtype)
         ys = []
 
         for t in range(T):
