@@ -87,6 +87,8 @@ MODE = os.environ.get("BC26_MODE", "submit").strip().lower()
  
 assert MODE in {"train", "submit"}
 print("MODE =", MODE)
+USE_GPU = os.environ.get("BC26_USE_GPU", "1").strip().lower() not in {"0", "false", "no"}
+print("USE_GPU =", USE_GPU)
 
 
 def _env_int(name, default):
@@ -324,11 +326,18 @@ infer_fn = None
 if USE_ONNX:
     _so = ort.SessionOptions()
     _so.intra_op_num_threads = 4
+    _providers = ["CPUExecutionProvider"]
+    try:
+        _avail = ort.get_available_providers()
+        if USE_GPU and "CUDAExecutionProvider" in _avail:
+            _providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
+    except Exception:
+        _providers = ["CPUExecutionProvider"]
     ONNX_SESSION    = ort.InferenceSession(str(ONNX_PERCH_PATH), sess_options=_so,
-                                            providers=["CPUExecutionProvider"])
+                                            providers=_providers)
     ONNX_INPUT_NAME = ONNX_SESSION.get_inputs()[0].name
     ONNX_OUT_MAP    = {o.name: i for i, o in enumerate(ONNX_SESSION.get_outputs())}
-    print("Using ONNX Perch (150x faster)")
+    print(f"Using ONNX Perch (150x faster) | providers={ONNX_SESSION.get_providers()}")
 else:
     if not _TF_AVAILABLE:
         raise RuntimeError(
@@ -966,6 +975,11 @@ print("[OK] CHANGE 1: Upgraded MLP probe (pca_dim=64, hidden=(128,64), max_iter=
 import torch
 import torch.nn as nn
 
+TORCH_DEVICE = torch.device(
+    "cuda" if (USE_GPU and torch.cuda.is_available()) else "cpu"
+)
+print(f"Torch device: {TORCH_DEVICE}")
+
 class VectorizedMLPProbes(nn.Module):
     """Stacks all per-class MLP weights into a single batched PyTorch model.
     Replaces the slow Python for-loop over probe_models at inference time."""
@@ -1036,10 +1050,10 @@ def apply_mlp_probes_vectorized(emb_test, scores_test, probe_models,
     X_all = np.concatenate(
         [Z_expanded.astype(np.float32), scalar_feats], axis=-1)
 
-    vec_probe = VectorizedMLPProbes(probe_models)
+    vec_probe = VectorizedMLPProbes(probe_models).to(TORCH_DEVICE)
     vec_probe.eval()
     with torch.no_grad():
-        preds = vec_probe(torch.tensor(X_all)).numpy()
+        preds = vec_probe(torch.tensor(X_all, device=TORCH_DEVICE)).detach().cpu().numpy()
 
     result = scores_test.copy()
     base_valid = scores_test[:, valid_classes]
@@ -1469,20 +1483,20 @@ def train_light_proto_ssm(
         n_sites=n_sites,
         use_cross_attn=True,
         cross_attn_heads=2,
-    )
+    ).to(TORCH_DEVICE)
 
     model.init_prototypes(
-        torch.tensor(emb_full, dtype=torch.float32),
-        torch.tensor(Y_full, dtype=torch.float32),
+        torch.tensor(emb_full, dtype=torch.float32, device=TORCH_DEVICE),
+        torch.tensor(Y_full, dtype=torch.float32, device=TORCH_DEVICE),
     )
 
     print(f"LightProtoSSM params: {model.count_parameters():,}")
 
-    emb_t = torch.tensor(emb_f, dtype=torch.float32)
-    log_t = torch.tensor(log_f, dtype=torch.float32)
-    lab_t = torch.tensor(lab_f, dtype=torch.float32)
-    site_t = torch.tensor(site_ids, dtype=torch.long)
-    hour_t = torch.tensor(hour_ids, dtype=torch.long)
+    emb_t = torch.tensor(emb_f, dtype=torch.float32, device=TORCH_DEVICE)
+    log_t = torch.tensor(log_f, dtype=torch.float32, device=TORCH_DEVICE)
+    lab_t = torch.tensor(lab_f, dtype=torch.float32, device=TORCH_DEVICE)
+    site_t = torch.tensor(site_ids, dtype=torch.long, device=TORCH_DEVICE)
+    hour_t = torch.tensor(hour_ids, dtype=torch.long, device=TORCH_DEVICE)
 
     pos_cnt = lab_t.sum(dim=(0, 1))
     total = lab_t.shape[0] * lab_t.shape[1]
@@ -1581,8 +1595,10 @@ def run_tta_proto(proto_model, emb_files, sc_files,
     proto_model.eval()
     all_preds = []
     
-    emb_t  = torch.tensor(emb_files, dtype=torch.float32)
-    sc_t   = torch.tensor(sc_files,  dtype=torch.float32)
+    emb_t  = torch.tensor(emb_files, dtype=torch.float32, device=TORCH_DEVICE)
+    sc_t   = torch.tensor(sc_files,  dtype=torch.float32, device=TORCH_DEVICE)
+    site_t = site_t.to(TORCH_DEVICE)
+    hour_t = hour_t.to(TORCH_DEVICE)
     
     for shift in shifts:
         if shift == 0:
@@ -1596,7 +1612,7 @@ def run_tta_proto(proto_model, emb_files, sc_files,
             out = proto_model(
                 e_shifted, s_shifted,
                 site_ids=site_t, hours=hour_t
-            ).numpy()
+            ).detach().cpu().numpy()
         
         if shift != 0:
             out = np.roll(out, -shift, axis=1)
@@ -1706,13 +1722,13 @@ def train_residual_ssm(emb_full, first_pass_flat, Y_full,
     perm     = torch.randperm(n_files, generator=rng).numpy()
     val_i    = perm[:n_val];  train_i = perm[n_val:]
 
-    emb_t    = torch.tensor(emb_f,    dtype=torch.float32)
-    fp_t     = torch.tensor(fp_f,     dtype=torch.float32)
-    res_t    = torch.tensor(residuals, dtype=torch.float32)
-    site_t   = torch.tensor(site_ids, dtype=torch.long)
-    hour_t   = torch.tensor(hour_ids, dtype=torch.long)
+    emb_t    = torch.tensor(emb_f,    dtype=torch.float32, device=TORCH_DEVICE)
+    fp_t     = torch.tensor(fp_f,     dtype=torch.float32, device=TORCH_DEVICE)
+    res_t    = torch.tensor(residuals, dtype=torch.float32, device=TORCH_DEVICE)
+    site_t   = torch.tensor(site_ids, dtype=torch.long, device=TORCH_DEVICE)
+    hour_t   = torch.tensor(hour_ids, dtype=torch.long, device=TORCH_DEVICE)
 
-    model    = ResidualSSM(n_classes=N_CLASSES)
+    model    = ResidualSSM(n_classes=N_CLASSES, n_sites=20).to(TORCH_DEVICE)
     print(f"ResidualSSM params: {model.count_parameters():,}")
 
     opt      = torch.optim.AdamW(
@@ -1758,7 +1774,7 @@ def train_residual_ssm(emb_full, first_pass_flat, Y_full,
     with torch.no_grad():
         all_corr = model(emb_t, fp_t,
                          site_ids=site_t,
-                         hours   =hour_t).numpy()
+                         hours   =hour_t).detach().cpu().numpy()
     print(f"Correction magnitude: "
           f"mean_abs={np.abs(all_corr).mean():.4f}  "
           f"max={np.abs(all_corr).max():.4f}")
@@ -1874,14 +1890,16 @@ def run_pipeline_oof(emb_full, sc_full, Y_full, meta_full, n_splits=5):
                 torch.tensor(
                     emb_va_f.reshape(n_va, N_WINDOWS, -1),
                     dtype=torch.float32,
+                    device=TORCH_DEVICE,
                 ),
                 torch.tensor(
                     sc_va_f.reshape(n_va, N_WINDOWS, -1),
                     dtype=torch.float32,
+                    device=TORCH_DEVICE,
                 ),
-                site_ids=torch.tensor(va_site_ids, dtype=torch.long),
-                hours=torch.tensor(va_hour_ids, dtype=torch.long),
-            ).numpy().reshape(-1, N_CLASSES)
+                site_ids=torch.tensor(va_site_ids, dtype=torch.long, device=TORCH_DEVICE),
+                hours=torch.tensor(va_hour_ids, dtype=torch.long, device=TORCH_DEVICE),
+            ).detach().cpu().numpy().reshape(-1, N_CLASSES)
 
         probe_models, emb_scaler, emb_pca, alpha_blend = train_mlp_probes(
             emb_tr_f,
@@ -1989,11 +2007,11 @@ if LOAD_FROM_CKPT:
         n_sites=n_sites_cap,
         use_cross_attn=True,
         cross_attn_heads=2,
-    )
+    ).to(TORCH_DEVICE)
     proto_model.load_state_dict(ckpt["proto_state_dict"], strict=True)
     proto_model.eval()
 
-    res_model = ResidualSSM(n_classes=N_CLASSES, n_sites=n_sites_cap)
+    res_model = ResidualSSM(n_classes=N_CLASSES, n_sites=n_sites_cap).to(TORCH_DEVICE)
     res_model.load_state_dict(ckpt["residual_state_dict"], strict=True)
     res_model.eval()
 
@@ -2121,11 +2139,11 @@ test_hour_ids = np.array([
 proto_model.eval()
 with torch.no_grad():
     proto_out = proto_model(
-        torch.tensor(emb_te_f, dtype=torch.float32),
-        torch.tensor(sc_te_f,  dtype=torch.float32),
-        site_ids=torch.tensor(test_site_ids, dtype=torch.long),
-        hours   =torch.tensor(test_hour_ids, dtype=torch.long),
-    ).numpy()
+        torch.tensor(emb_te_f, dtype=torch.float32, device=TORCH_DEVICE),
+        torch.tensor(sc_te_f,  dtype=torch.float32, device=TORCH_DEVICE),
+        site_ids=torch.tensor(test_site_ids, dtype=torch.long, device=TORCH_DEVICE),
+        hours   =torch.tensor(test_hour_ids, dtype=torch.long, device=TORCH_DEVICE),
+    ).detach().cpu().numpy()
 proto_scores_flat = proto_out.reshape(-1, N_CLASSES).astype(np.float32)
 
 sc_te_adjusted = apply_prior(
@@ -2146,11 +2164,11 @@ first_pass_te_f  = first_pass_flat.reshape(n_test_files, N_WINDOWS, -1)
 res_model.eval()
 with torch.no_grad():
     test_correction = res_model(
-        torch.tensor(emb_te_f,         dtype=torch.float32),
-        torch.tensor(first_pass_te_f,  dtype=torch.float32),
-        site_ids=torch.tensor(test_site_ids, dtype=torch.long),
-        hours   =torch.tensor(test_hour_ids, dtype=torch.long),
-    ).numpy()
+        torch.tensor(emb_te_f,         dtype=torch.float32, device=TORCH_DEVICE),
+        torch.tensor(first_pass_te_f,  dtype=torch.float32, device=TORCH_DEVICE),
+        site_ids=torch.tensor(test_site_ids, dtype=torch.long, device=TORCH_DEVICE),
+        hours   =torch.tensor(test_hour_ids, dtype=torch.long, device=TORCH_DEVICE),
+    ).detach().cpu().numpy()
 
 correction_flat = test_correction.reshape(-1, N_CLASSES).astype(np.float32)
 final_scores    = (first_pass_flat

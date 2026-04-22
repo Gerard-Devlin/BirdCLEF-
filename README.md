@@ -36,6 +36,7 @@ You need these assets:
 - `BC26_ONNX_PATH`: optional ONNX model path
 - `BC26_EXTRA_CACHE_DIRS`: extra cache dirs separated by `:` on Linux or `;` on Windows
 - `BC26_CKPT_PATH`: optional pipeline ckpt path (save when training, load when exists)
+- `BC26_USE_GPU`: `1` to prefer GPU for torch/onnxruntime, `0` to force CPU
 
 ### Optional Tunables (env vars)
 
@@ -58,6 +59,7 @@ BC26_SUBMISSION_PATH=/data/work/submission_local.csv \
 BC26_ONNX_PATH=/data/perch-onnx-for-birdclef-2026/perch_v2.onnx \
 BC26_EXTRA_CACHE_DIRS=/data/perch-meta \
 BC26_CKPT_PATH=/data/work/two_pass_pipeline_ckpt.pth \
+BC26_USE_GPU=1 \
 python scripts/two_pass_ssm_pipeline_v2.py
 ```
 
