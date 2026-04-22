@@ -1876,18 +1876,153 @@ print(f"Test scores: {sc_te.shape}")
 def sigmoid(x):
     return 1.0 / (1.0 + np.exp(-np.clip(x, -30, 30)))
 
-t0 = time.time()
-proto_model, site2i_tr = train_light_proto_ssm(
-    emb_tr, sc_tr, Y_FULL_aligned, meta_tr,
-    n_epochs=40, patience=8, lr=1e-3, verbose=False)
-print(f"ProtoSSM training: {time.time()-t0:.1f}s")
+CKPT_PATH_RAW = os.environ.get("BC26_CKPT_PATH", "").strip()
+CKPT_PATH = Path(CKPT_PATH_RAW) if CKPT_PATH_RAW else None
+LOAD_FROM_CKPT = bool(CKPT_PATH is not None and CKPT_PATH.exists())
+SAVE_TO_CKPT = bool(CKPT_PATH is not None)
+
+n_sites_cap = 20
+ENSEMBLE_W = 0.5
+
+if LOAD_FROM_CKPT:
+    print(f"Loading pipeline checkpoint: {CKPT_PATH}")
+    ckpt = torch.load(CKPT_PATH, map_location="cpu", weights_only=False)
+    ckpt_labels = ckpt.get("primary_labels")
+    if ckpt_labels is not None and list(ckpt_labels) != list(PRIMARY_LABELS):
+        raise RuntimeError(
+            "Checkpoint label space mismatch with current sample_submission."
+        )
+
+    site2i_tr = dict(ckpt["site2i_tr"])
+    prior_tables = ckpt["prior_tables"]
+    probe_models = ckpt["probe_models"]
+    emb_scaler = ckpt["emb_scaler"]
+    emb_pca = ckpt["emb_pca"]
+    alpha_blend = float(ckpt.get("alpha_blend", 0.4))
+    ENSEMBLE_W = float(ckpt.get("ensemble_w", 0.5))
+    correction_weight = float(ckpt.get("correction_weight", 0.30))
+    temperatures = np.asarray(ckpt["temperatures"], dtype=np.float32)
+    PER_CLASS_THRESHOLDS = np.asarray(ckpt["per_class_thresholds"], dtype=np.float32)
+    n_sites_cap = int(ckpt.get("n_sites_cap", 20))
+
+    proto_model = LightProtoSSM(
+        n_classes=N_CLASSES,
+        n_sites=n_sites_cap,
+        use_cross_attn=True,
+        cross_attn_heads=2,
+    )
+    proto_model.load_state_dict(ckpt["proto_state_dict"], strict=True)
+    proto_model.eval()
+
+    res_model = ResidualSSM(n_classes=N_CLASSES, n_sites=n_sites_cap)
+    res_model.load_state_dict(ckpt["residual_state_dict"], strict=True)
+    res_model.eval()
+
+    print(
+        f"Checkpoint loaded: probes={len(probe_models)} "
+        f"| n_sites_cap={n_sites_cap} | alpha_blend={alpha_blend:.3f}"
+    )
+else:
+    t0 = time.time()
+    proto_model, site2i_tr = train_light_proto_ssm(
+        emb_tr, sc_tr, Y_FULL_aligned, meta_tr,
+        n_epochs=40, patience=8, lr=1e-3, verbose=False)
+    print(f"ProtoSSM training: {time.time()-t0:.1f}s")
+
+    prior_tables = build_prior_tables(sc, Y_SC)
+    probe_models, emb_scaler, emb_pca, alpha_blend = train_mlp_probes(
+        emb=emb_tr, scores_raw=sc_tr, Y=Y_FULL_aligned,
+        min_pos=5, pca_dim=64, alpha_blend=0.4,
+    )
+
+    n_tr_files    = len(sc_tr) // N_WINDOWS
+    emb_tr_f      = emb_tr.reshape(n_tr_files, N_WINDOWS, -1)
+    sc_tr_f       = sc_tr.reshape(n_tr_files, N_WINDOWS, -1)
+
+    tr_fnames     = meta_tr.drop_duplicates("filename")["filename"].tolist()
+    tr_site_ids   = np.array([
+        min(site2i_tr.get(
+            meta_tr.loc[meta_tr["filename"]==fn,"site"].iloc[0], 0),
+            n_sites_cap-1)
+        for fn in tr_fnames], dtype=np.int64)
+    tr_hour_ids   = np.array([
+        int(meta_tr.loc[meta_tr["filename"]==fn,"hour_utc"].iloc[0]) % 24
+        for fn in tr_fnames], dtype=np.int64)
+
+    proto_tr_out = run_tta_proto(
+        proto_model, emb_tr_f, sc_tr_f,
+        site_t=torch.tensor(tr_site_ids, dtype=torch.long),
+        hour_t=torch.tensor(tr_hour_ids, dtype=torch.long),
+        shifts=[0, 1, -1, 2, -2],
+    )
+    proto_tr_flat = proto_tr_out.reshape(-1, N_CLASSES).astype(np.float32)
+
+    sc_tr_prior   = apply_prior(
+        sc_tr,
+        sites=meta_tr["site"].to_numpy(),
+        hours=meta_tr["hour_utc"].to_numpy(),
+        tables=prior_tables,
+        lambda_prior=0.4,
+    )
+    sc_tr_mlp = apply_mlp_probes_vectorized(
+        emb_tr, sc_tr_prior,
+        probe_models, emb_scaler, emb_pca, alpha_blend,
+    )
+    first_pass_tr = (ENSEMBLE_W * proto_tr_flat
+                     + (1.0 - ENSEMBLE_W) * sc_tr_mlp)
+
+    train_probs_for_calib = sigmoid(first_pass_tr)
+    PER_CLASS_THRESHOLDS = calibrate_and_optimize_thresholds(
+        oof_probs=train_probs_for_calib,
+        Y_FULL=Y_FULL_aligned,
+        threshold_grid=[0.25, 0.30, 0.35, 0.40, 0.45, 0.50, 0.55, 0.60, 0.65, 0.70],
+        n_windows=N_WINDOWS,
+    )
+
+    t0 = time.time()
+    res_model, correction_weight = train_residual_ssm(
+        emb_full=emb_tr,
+        first_pass_flat=first_pass_tr,
+        Y_full=Y_FULL_aligned,
+        site_ids=tr_site_ids,
+        hour_ids=tr_hour_ids,
+        n_epochs=30,
+        patience=8,
+        lr=1e-3,
+        correction_weight=0.30,
+        verbose=False,
+    )
+    print(f"ResidualSSM training: {time.time()-t0:.1f}s")
+
+    if SAVE_TO_CKPT:
+        CKPT_PATH.parent.mkdir(parents=True, exist_ok=True)
+        torch.save(
+            {
+                "primary_labels": PRIMARY_LABELS,
+                "n_classes": N_CLASSES,
+                "n_sites_cap": n_sites_cap,
+                "site2i_tr": site2i_tr,
+                "proto_state_dict": proto_model.state_dict(),
+                "residual_state_dict": res_model.state_dict(),
+                "prior_tables": prior_tables,
+                "probe_models": probe_models,
+                "emb_scaler": emb_scaler,
+                "emb_pca": emb_pca,
+                "alpha_blend": float(alpha_blend),
+                "ensemble_w": float(ENSEMBLE_W),
+                "correction_weight": float(correction_weight),
+                "temperatures": temperatures.astype(np.float32),
+                "per_class_thresholds": PER_CLASS_THRESHOLDS.astype(np.float32),
+            },
+            CKPT_PATH,
+        )
+        print(f"Pipeline checkpoint saved to: {CKPT_PATH}")
 
 n_test_files  = len(sc_te) // N_WINDOWS
 emb_te_f      = emb_te.reshape(n_test_files, N_WINDOWS, -1)
 sc_te_f       = sc_te.reshape(n_test_files, N_WINDOWS, -1)
 
 test_fnames   = meta_te.drop_duplicates("filename")["filename"].tolist()
-n_sites_cap   = 20
 test_site_ids = np.array([
     min(site2i_tr.get(
         meta_te.loc[meta_te["filename"]==fn,"site"].iloc[0], 0),
@@ -1907,7 +2042,6 @@ with torch.no_grad():
     ).numpy()
 proto_scores_flat = proto_out.reshape(-1, N_CLASSES).astype(np.float32)
 
-prior_tables   = build_prior_tables(sc, Y_SC)
 sc_te_adjusted = apply_prior(
     sc_te,
     sites=meta_te["site"].to_numpy(),
@@ -1915,81 +2049,12 @@ sc_te_adjusted = apply_prior(
     tables=prior_tables,
     lambda_prior=0.4,
 )
-
-probe_models, emb_scaler, emb_pca, alpha_blend = train_mlp_probes(
-    emb=emb_tr, scores_raw=sc_tr, Y=Y_FULL_aligned,
-    min_pos=5, pca_dim=64, alpha_blend=0.4,
-)
 sc_te_adjusted = apply_mlp_probes_vectorized(
     emb_te, sc_te_adjusted,
     probe_models, emb_scaler, emb_pca, alpha_blend,
 )
-
-ENSEMBLE_W      = 0.5
 first_pass_flat = (ENSEMBLE_W * proto_scores_flat
                    + (1.0 - ENSEMBLE_W) * sc_te_adjusted)
-
-n_tr_files    = len(sc_tr) // N_WINDOWS
-emb_tr_f      = emb_tr.reshape(n_tr_files, N_WINDOWS, -1)
-sc_tr_f       = sc_tr.reshape(n_tr_files, N_WINDOWS, -1)
-
-tr_fnames     = meta_tr.drop_duplicates("filename")["filename"].tolist()
-tr_site_ids   = np.array([
-    min(site2i_tr.get(
-        meta_tr.loc[meta_tr["filename"]==fn,"site"].iloc[0], 0),
-        n_sites_cap-1)
-    for fn in tr_fnames], dtype=np.int64)
-tr_hour_ids   = np.array([
-    int(meta_tr.loc[meta_tr["filename"]==fn,"hour_utc"].iloc[0]) % 24
-    for fn in tr_fnames], dtype=np.int64)
-
-
-proto_tr_out = run_tta_proto(
-    proto_model, emb_tr_f, sc_tr_f,
-    site_t=torch.tensor(tr_site_ids, dtype=torch.long),
-    hour_t=torch.tensor(tr_hour_ids, dtype=torch.long),
-    shifts=[0, 1, -1, 2, -2],
-)
-
-proto_tr_flat = proto_tr_out.reshape(-1, N_CLASSES).astype(np.float32)
-
-sc_tr_prior   = apply_prior(
-    sc_tr,
-    sites=meta_tr["site"].to_numpy(),
-    hours=meta_tr["hour_utc"].to_numpy(),
-    tables=prior_tables,
-    lambda_prior=0.4,
-)
-sc_tr_mlp = apply_mlp_probes_vectorized(
-    emb_tr, sc_tr_prior,
-    probe_models, emb_scaler, emb_pca, alpha_blend,
-)
-first_pass_tr = (ENSEMBLE_W * proto_tr_flat
-                 + (1.0 - ENSEMBLE_W) * sc_tr_mlp)
-
-train_probs_for_calib = sigmoid(first_pass_tr)
-PER_CLASS_THRESHOLDS = calibrate_and_optimize_thresholds(
-    oof_probs=train_probs_for_calib,
-    Y_FULL=Y_FULL_aligned,
-    threshold_grid=[0.25, 0.30, 0.35, 0.40, 0.45, 0.50, 0.55, 0.60, 0.65, 0.70],
-    n_windows=N_WINDOWS,
-)
-
-
-t0 = time.time()
-res_model, correction_weight = train_residual_ssm(
-    emb_full=emb_tr,
-    first_pass_flat=first_pass_tr,
-    Y_full=Y_FULL_aligned,
-    site_ids=tr_site_ids,
-    hour_ids=tr_hour_ids,
-    n_epochs=30,
-    patience=8,
-    lr=1e-3,
-    correction_weight=0.30,
-    verbose=False,
-)
-print(f"ResidualSSM training: {time.time()-t0:.1f}s")
 
 first_pass_te_f  = first_pass_flat.reshape(n_test_files, N_WINDOWS, -1)
 res_model.eval()

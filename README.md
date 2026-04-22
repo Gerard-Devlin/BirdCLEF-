@@ -1,4 +1,4 @@
-# BirdCLEF+ 2026 (Gold-Pipeline Only)
+# BirdCLEF+ 2026
 
 This repo now keeps only the gold-inspired pipeline:
 
@@ -12,19 +12,19 @@ All old baseline training/inference code was removed.
 You need these assets:
 
 1. Competition data (`birdclef-2026`)
-   - `taxonomy.csv`
-   - `sample_submission.csv`
-   - `train_soundscapes_labels.csv`
-   - `train_soundscapes/*.ogg`
-   - `test_soundscapes/*.ogg` (for real submit rerun)
+    - `taxonomy.csv`
+    - `sample_submission.csv`
+    - `train_soundscapes_labels.csv`
+    - `train_soundscapes/*.ogg`
+    - `test_soundscapes/*.ogg` (for real submit rerun)
 2. Perch pretrained model
-   - `.../perch_v2_cpu/1/` with `saved_model.pb`, `variables`, `assets/labels.csv`
+    - `.../perch_v2_cpu/1/` with `saved_model.pb`, `variables`, `assets/labels.csv`
 3. Perch cache dataset (strongly recommended)
-   - `perch_meta.parquet`
-   - `perch_arrays.npz`
+    - `perch_meta.parquet`
+    - `perch_arrays.npz`
 4. Optional speedup
-   - `perch_v2.onnx`
-   - `onnxruntime` wheel
+    - `perch_v2.onnx`
+    - `onnxruntime` wheel
 
 ## Environment Variables Used By Script
 
@@ -36,7 +36,7 @@ You need these assets:
 - `BC26_ONNX_PATH`: optional ONNX model path
 - `BC26_EXTRA_CACHE_DIRS`: extra cache dirs separated by `:` on Linux or `;` on Windows
 
-## Local Run Example (Linux)
+## Local Fine-Tune + Export CKPT (Linux)
 
 ```bash
 BC26_MODE=train \
@@ -46,10 +46,46 @@ BC26_WORK_DIR=/data/work/cache \
 BC26_SUBMISSION_PATH=/data/work/submission_local.csv \
 BC26_ONNX_PATH=/data/perch-onnx-for-birdclef-2026/perch_v2.onnx \
 BC26_EXTRA_CACHE_DIRS=/data/perch-meta \
+BC26_CKPT_PATH=/data/work/two_pass_pipeline_ckpt.pth \
 python scripts/two_pass_ssm_pipeline_v2.py
 ```
 
-## Kaggle Run Example
+After this run, `BC26_CKPT_PATH` is your offline fine-tuned checkpoint bundle.
+
+## Kaggle Pure Inference (No Fine-Tune)
+
+Use `scripts/infer_pt.py` so Kaggle only loads ckpt and runs inference.
+
+Notebook Cell 1 (path setup):
+
+```python
+import os
+
+bundle_root = "/kaggle/input/<your-code-dataset-root>"
+ckpt_path = "/kaggle/input/<your-ckpt-dataset-root>/two_pass_pipeline_ckpt.pth"
+base = "/kaggle/input/competitions/birdclef-2026"
+model_dir = "/kaggle/input/models/google/bird-vocalization-classifier/tensorflow2/perch_v2_cpu/1"
+onnx_path = "/kaggle/input/perch-onnx-for-birdclef+2026/perch_v2.onnx"
+extra_cache_dirs = "/kaggle/input/perch_meta"
+
+print(os.path.exists(bundle_root), os.path.exists(ckpt_path), os.path.exists(base))
+```
+
+Notebook Cell 2 (inference only):
+
+```python
+!PYTHONNOUSERSITE=1 python {bundle_root}/scripts/infer_pt.py \
+  --checkpoint {ckpt_path} \
+  --base {base} \
+  --model-dir {model_dir} \
+  --onnx-path {onnx_path} \
+  --extra-cache-dirs {extra_cache_dirs} \
+  --output /kaggle/working/submission.csv
+```
+
+The notebook version must output `/kaggle/working/submission.csv`.
+
+## Direct Submit-Mode Run (Legacy)
 
 ```python
 !PYTHONNOUSERSITE=1 BC26_MODE=submit python /kaggle/working/scripts/two_pass_ssm_pipeline_v2.py
