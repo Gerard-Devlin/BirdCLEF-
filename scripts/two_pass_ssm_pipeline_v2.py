@@ -1975,8 +1975,25 @@ def sigmoid(x):
 
 CKPT_PATH_RAW = os.environ.get("BC26_CKPT_PATH", "").strip()
 CKPT_PATH = Path(CKPT_PATH_RAW) if CKPT_PATH_RAW else None
-LOAD_FROM_CKPT = bool(CKPT_PATH is not None and CKPT_PATH.exists())
-SAVE_TO_CKPT = bool(CKPT_PATH is not None)
+LOAD_FROM_CKPT_IN_TRAIN = os.environ.get("BC26_LOAD_CKPT_IN_TRAIN", "0").strip().lower() in {"1", "true", "yes"}
+LOAD_FROM_CKPT = bool(
+    CKPT_PATH is not None
+    and CKPT_PATH.exists()
+    and (MODE == "submit" or LOAD_FROM_CKPT_IN_TRAIN)
+)
+SAVE_TO_CKPT = bool(CKPT_PATH is not None and MODE == "train")
+
+
+def _sanitize_torch_state_dict(state_dict):
+    cleaned = {}
+    for k, v in state_dict.items():
+        if k == "n_averaged":
+            continue
+        if k.startswith("module."):
+            cleaned[k[len("module."):]] = v
+        else:
+            cleaned[k] = v
+    return cleaned
 
 n_sites_cap = 20
 ENSEMBLE_W = float(TUNE["ensemble_w"])
@@ -2008,11 +2025,13 @@ if LOAD_FROM_CKPT:
         use_cross_attn=True,
         cross_attn_heads=2,
     ).to(TORCH_DEVICE)
-    proto_model.load_state_dict(ckpt["proto_state_dict"], strict=True)
+    proto_sd = _sanitize_torch_state_dict(ckpt["proto_state_dict"])
+    proto_model.load_state_dict(proto_sd, strict=True)
     proto_model.eval()
 
     res_model = ResidualSSM(n_classes=N_CLASSES, n_sites=n_sites_cap).to(TORCH_DEVICE)
-    res_model.load_state_dict(ckpt["residual_state_dict"], strict=True)
+    res_sd = _sanitize_torch_state_dict(ckpt["residual_state_dict"])
+    res_model.load_state_dict(res_sd, strict=True)
     res_model.eval()
 
     print(

@@ -65,6 +65,54 @@ python scripts/two_pass_ssm_pipeline_v2.py
 
 After this run, `BC26_CKPT_PATH` is your offline fine-tuned checkpoint bundle.
 
+## Server Training Command (nohup)
+
+Use this exact command on server:
+
+```bash
+cd ~/birdclef+
+conda activate birdclef
+ROOT="$PWD"
+mkdir -p "$ROOT/logs" "$ROOT/work/cache" "$ROOT/work/ckpt"
+
+CKPT="$ROOT/work/ckpt/two_pass_pipeline_ckpt_v2.pth"
+nohup env PYTHONNOUSERSITE=1 \
+BC26_USE_GPU=1 \
+BC26_MODE=train \
+BC26_BASE="$ROOT/dataset" \
+BC26_MODEL_DIR="$ROOT/models/bird-vocalization-classifier-tensorflow2-perch_v2_cpu-v1" \
+BC26_WORK_DIR="$ROOT/work/cache" \
+BC26_SUBMISSION_PATH="$ROOT/work/submission_local_v2.csv" \
+BC26_ONNX_PATH="$ROOT/source/Perch-onnx-for-birdclef+2026/perch_v2.onnx" \
+BC26_EXTRA_CACHE_DIRS="$ROOT/source/Perch_meta" \
+BC26_CKPT_PATH="$CKPT" \
+BC26_PROTO_EPOCHS=80 \
+BC26_PROTO_PATIENCE=16 \
+BC26_PROTO_LR=8e-4 \
+BC26_RES_EPOCHS=60 \
+BC26_RES_PATIENCE=14 \
+BC26_RES_LR=8e-4 \
+BC26_MLP_MIN_POS=3 \
+python scripts/two_pass_ssm_pipeline_v2.py > "$ROOT/logs/train_ckpt_v2.log" 2>&1 &
+
+echo $! > "$ROOT/logs/train_ckpt_v2.pid"
+tail -f "$ROOT/logs/train_ckpt_v2.log"
+```
+
+Completion signals:
+
+- `Full pipeline OOF AUC: ...`
+- `Pipeline checkpoint saved to: ...`
+- `submission_local_v2.csv saved ...`
+
+Common issues:
+
+- `Permission denied: /work`: `ROOT` was empty; run `ROOT="$PWD"` first.
+- `Unable to find a usable engine ... parquet`: install in current env via `python -m pip install pyarrow`.
+- `cuda:0 and cpu mismatch`: pull latest code (`git pull`) and rerun.
+- If `BC26_CKPT_PATH` already exists, `BC26_MODE=train` now ignores loading it by default and only saves new ckpt at the end.  
+  To force loading ckpt during train mode, set `BC26_LOAD_CKPT_IN_TRAIN=1`.
+
 ## Kaggle Pure Inference (No Fine-Tune)
 
 Use `scripts/infer_pt.py` so Kaggle only loads ckpt and runs inference.
