@@ -174,7 +174,7 @@ FILE_SAMPLES   = 60 * SR
 N_WINDOWS      = 12
  
 CFG = {
-    "batch_files": 16,
+    "batch_files": _env_int("BC26_BATCH_FILES", 16),
     "oof_n_splits": 5   if MODE == "train" else 3,
     "dryrun_n_files": 20 if MODE == "train" else 0,
     "run_oof": MODE == "train",
@@ -509,9 +509,36 @@ def run_perch(paths, batch_files=16, verbose=True):
                 wr += N_WINDOWS
 
             if USE_ONNX:
-                outs   = ONNX_SESSION.run(None, {ONNX_INPUT_NAME: x})
-                logits = outs[ONNX_OUT_MAP["label"]].astype(np.float32)
-                emb    = outs[ONNX_OUT_MAP["embedding"]].astype(np.float32)
+                def _run_onnx_with_auto_chunk(batch_audio, min_chunk=8):
+                    try:
+                        _outs = ONNX_SESSION.run(None, {ONNX_INPUT_NAME: batch_audio})
+                        _logits = _outs[ONNX_OUT_MAP["label"]].astype(np.float32)
+                        _emb = _outs[ONNX_OUT_MAP["embedding"]].astype(np.float32)
+                        return _logits, _emb
+                    except Exception as e:
+                        msg = str(e).lower()
+                        oom_like = (
+                            "failed to allocate memory" in msg
+                            or "cuda out of memory" in msg
+                            or "bfc_arena" in msg
+                        )
+                        if (not oom_like) or len(batch_audio) <= min_chunk:
+                            raise
+                        n = len(batch_audio)
+                        mid = n // 2
+                        if verbose:
+                            print(
+                                f"[WARN] ONNX OOM at batch={n}, retry chunks {mid}+{n-mid}",
+                                flush=True,
+                            )
+                        l_logit, l_emb = _run_onnx_with_auto_chunk(batch_audio[:mid], min_chunk=min_chunk)
+                        r_logit, r_emb = _run_onnx_with_auto_chunk(batch_audio[mid:], min_chunk=min_chunk)
+                        return (
+                            np.concatenate([l_logit, r_logit], axis=0),
+                            np.concatenate([l_emb, r_emb], axis=0),
+                        )
+
+                logits, emb = _run_onnx_with_auto_chunk(x)
             else:
                 out    = infer_fn(inputs=tf.convert_to_tensor(x))
                 logits = out["label"].numpy().astype(np.float32)
