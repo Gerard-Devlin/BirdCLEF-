@@ -79,8 +79,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--adapter-arch",
         type=str,
-        default="mlp3_gated",
-        choices=["linear", "mlp3_gated", "mlp2_legacy"],
+        default="sep_gated2",
+        choices=["linear", "mlp3_gated", "mlp2_legacy", "sep_gated2"],
         help="Adapter architecture.",
     )
     p.add_argument(
@@ -284,6 +284,59 @@ class PerchAdapterHeadGated(nn.Module):
         return g * self.delta(h)
 
 
+class PerchAdapterHeadSepGated(nn.Module):
+    """Two-layer separated gated residual adapter.
+
+    Not a plain FC on concatenated [emb, logits]:
+    - Embedding branch predicts per-class gate and bias.
+    - Logit branch is class-wise normalized and scaled.
+    - delta = gate(emb) * scaled_logits + bias(emb)
+    """
+
+    def __init__(
+        self,
+        emb_dim: int,
+        output_dim: int,
+        hidden_dim: int,
+        dropout: float,
+    ):
+        super().__init__()
+        self.emb_dim = int(emb_dim)
+        self.output_dim = int(output_dim)
+        self.emb_ln = nn.LayerNorm(self.emb_dim)
+        self.logit_ln = nn.LayerNorm(self.output_dim)
+        self.gate_mlp = nn.Sequential(
+            nn.Linear(self.emb_dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, self.output_dim),
+        )
+        self.bias_mlp = nn.Sequential(
+            nn.Linear(self.emb_dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, self.output_dim),
+        )
+        # Class-wise scale on normalized input logits.
+        self.logit_scale = nn.Parameter(torch.zeros(self.output_dim))
+
+        # Conservative start: tiny correction then learn.
+        nn.init.zeros_(self.gate_mlp[-1].weight)
+        nn.init.constant_(self.gate_mlp[-1].bias, -2.0)
+        nn.init.zeros_(self.bias_mlp[-1].weight)
+        nn.init.zeros_(self.bias_mlp[-1].bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        emb = x[:, : self.emb_dim]
+        logits_in = x[:, self.emb_dim : self.emb_dim + self.output_dim]
+        emb_n = self.emb_ln(emb)
+        logits_n = self.logit_ln(logits_in)
+        gate = torch.sigmoid(self.gate_mlp(emb_n))
+        bias = self.bias_mlp(emb_n)
+        scaled_logits = logits_n * torch.tanh(self.logit_scale)[None, :]
+        return gate * scaled_logits + bias
+
+
 def build_adapter_model(input_dim: int, output_dim: int, args: argparse.Namespace) -> tuple[nn.Module, dict]:
     arch = str(args.adapter_arch).strip().lower()
     if arch == "linear":
@@ -297,6 +350,28 @@ def build_adapter_model(input_dim: int, output_dim: int, args: argparse.Namespac
             "hidden_dim2": 0,
             "gate_bias": 0.0,
             "dropout": 0.0,
+        }
+        return model, meta
+
+    if arch == "sep_gated2":
+        emb_dim = int(input_dim - output_dim)
+        if emb_dim <= 0:
+            raise RuntimeError(
+                f"sep_gated2 requires input_dim > output_dim, got {input_dim} vs {output_dim}"
+            )
+        model = PerchAdapterHeadSepGated(
+            emb_dim=emb_dim,
+            output_dim=output_dim,
+            hidden_dim=int(args.hidden_dim),
+            dropout=float(args.dropout),
+        )
+        meta = {
+            "adapter_arch": "sep_gated2",
+            "hidden_dim": int(args.hidden_dim),
+            "hidden_dim2": 0,
+            "gate_bias": -2.0,
+            "dropout": float(args.dropout),
+            "emb_dim": int(emb_dim),
         }
         return model, meta
 
@@ -316,6 +391,7 @@ def build_adapter_model(input_dim: int, output_dim: int, args: argparse.Namespac
             "hidden_dim2": int(hidden_dim2),
             "gate_bias": float(args.gate_bias),
             "dropout": float(args.dropout),
+            "emb_dim": int(input_dim - output_dim),
         }
         return model, meta
 
@@ -331,6 +407,7 @@ def build_adapter_model(input_dim: int, output_dim: int, args: argparse.Namespac
         "hidden_dim2": 0,
         "gate_bias": 0.0,
         "dropout": float(args.dropout),
+        "emb_dim": int(input_dim - output_dim),
     }
     return model, meta
 
@@ -668,6 +745,7 @@ def main() -> None:
             "hidden_dim": int(adapter_meta.get("hidden_dim", args.hidden_dim)),
             "hidden_dim2": int(adapter_meta.get("hidden_dim2", 0)),
             "gate_bias": float(adapter_meta.get("gate_bias", 0.0)),
+            "emb_dim": int(adapter_meta.get("emb_dim", int(X.shape[1]) - n_classes)),
             "output_dim": int(n_classes),
             "dropout": float(args.dropout),
             "primary_labels": primary_labels,

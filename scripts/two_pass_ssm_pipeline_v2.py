@@ -1140,6 +1140,54 @@ class PerchAdapterHeadGated(nn.Module):
         return g * self.delta(h)
 
 
+class PerchAdapterHeadSepGated(nn.Module):
+    """Two-layer separated gated residual adapter.
+
+    delta = gate(emb) * scaled_logits + bias(emb)
+    """
+
+    def __init__(
+        self,
+        emb_dim=1536,
+        output_dim=234,
+        hidden_dim=512,
+        dropout=0.2,
+    ):
+        super().__init__()
+        self.emb_dim = int(emb_dim)
+        self.output_dim = int(output_dim)
+        self.emb_ln = nn.LayerNorm(self.emb_dim)
+        self.logit_ln = nn.LayerNorm(self.output_dim)
+        self.gate_mlp = nn.Sequential(
+            nn.Linear(self.emb_dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, self.output_dim),
+        )
+        self.bias_mlp = nn.Sequential(
+            nn.Linear(self.emb_dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, self.output_dim),
+        )
+        self.logit_scale = nn.Parameter(torch.zeros(self.output_dim))
+
+        nn.init.zeros_(self.gate_mlp[-1].weight)
+        nn.init.constant_(self.gate_mlp[-1].bias, -2.0)
+        nn.init.zeros_(self.bias_mlp[-1].weight)
+        nn.init.zeros_(self.bias_mlp[-1].bias)
+
+    def forward(self, x):
+        emb = x[:, : self.emb_dim]
+        logits_in = x[:, self.emb_dim : self.emb_dim + self.output_dim]
+        emb_n = self.emb_ln(emb)
+        logits_n = self.logit_ln(logits_in)
+        gate = torch.sigmoid(self.gate_mlp(emb_n))
+        bias = self.bias_mlp(emb_n)
+        scaled_logits = logits_n * torch.tanh(self.logit_scale)[None, :]
+        return gate * scaled_logits + bias
+
+
 def _sanitize_state_dict_local(state_dict):
     cleaned = {}
     for k, v in state_dict.items():
@@ -1160,6 +1208,16 @@ def _detect_adapter_arch_from_ckpt(ckpt):
     has_linear_keys = any(k.startswith("linear.") for k in state_keys)
     if has_linear_keys:
         return "linear"
+    has_sep_keys = any(
+        k.startswith("emb_ln.")
+        or k.startswith("logit_ln.")
+        or k.startswith("gate_mlp.")
+        or k.startswith("bias_mlp.")
+        or k.startswith("logit_scale")
+        for k in state_keys
+    )
+    if has_sep_keys:
+        return "sep_gated2"
     has_gated_keys = any(
         k.startswith("fc1.")
         or k.startswith("fc2.")
@@ -1192,11 +1250,19 @@ def _load_perch_adapter_from_env():
     dropout = float(ckpt.get("dropout", 0.2))
     hidden_dim2 = int(ckpt.get("hidden_dim2", max(128, hidden_dim // 2)))
     gate_bias = float(ckpt.get("gate_bias", -2.0))
+    emb_dim = int(ckpt.get("emb_dim", max(1, input_dim - output_dim)))
 
     if arch == "linear":
         model = PerchAdapterHeadLinear(
             input_dim=input_dim,
             output_dim=output_dim,
+        ).to(TORCH_DEVICE)
+    elif arch == "sep_gated2":
+        model = PerchAdapterHeadSepGated(
+            emb_dim=emb_dim,
+            output_dim=output_dim,
+            hidden_dim=hidden_dim,
+            dropout=dropout,
         ).to(TORCH_DEVICE)
     elif arch == "mlp3_gated":
         model = PerchAdapterHeadGated(
@@ -1220,7 +1286,7 @@ def _load_perch_adapter_from_env():
     model.eval()
     print(
         f"[OK] Loaded Perch adapter: {ckpt_path} "
-        f"(arch={arch}, hidden={hidden_dim}, hidden2={hidden_dim2}, weight={PERCH_ADAPTER_WEIGHT})"
+        f"(arch={arch}, hidden={hidden_dim}, hidden2={hidden_dim2}, emb_dim={emb_dim}, weight={PERCH_ADAPTER_WEIGHT})"
     )
     return model
 
