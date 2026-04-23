@@ -386,9 +386,14 @@ def main() -> None:
 
     skipped = 0
     total_windows = 0
-    pbar = tqdm(train_df.itertuples(index=False), total=len(train_df), desc="Extract")
-    for file_idx, row in enumerate(pbar):
-        rel = str(getattr(row, "filename"))
+    file_list = train_df["filename"].astype(str).tolist()
+    label_list = train_df["__labels"].tolist()
+    pbar = tqdm(
+        enumerate(zip(file_list, label_list)),
+        total=len(file_list),
+        desc="Extract",
+    )
+    for file_idx, (rel, labels_for_row) in pbar:
         path = args.audio_dir / rel
         if not path.exists():
             skipped += 1
@@ -400,7 +405,7 @@ def main() -> None:
             skipped += 1
             continue
         target = np.zeros(n_classes, dtype=np.float32)
-        for lbl in getattr(row, "__labels"):
+        for lbl in labels_for_row:
             target[label_to_idx[lbl]] = 1.0
         for w in windows:
             pending_audio.append(w)
@@ -449,4 +454,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
