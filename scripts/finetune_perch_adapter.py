@@ -402,11 +402,38 @@ def main() -> None:
     y_all = []
     groups_all: List[int] = []
 
+    def infer_with_auto_chunk(batch_audio: np.ndarray, min_chunk: int = 4) -> tuple[np.ndarray, np.ndarray]:
+        """Run Perch inference with OOM-aware chunk fallback."""
+        try:
+            return runner.infer(batch_audio)
+        except Exception as e:
+            msg = str(e).lower()
+            oom_like = (
+                "failed to allocate memory" in msg
+                or "cuda out of memory" in msg
+                or "bfc_arena" in msg
+            )
+            if (not oom_like) or len(batch_audio) <= min_chunk:
+                raise
+
+            n = len(batch_audio)
+            mid = n // 2
+            print(
+                f"[WARN] OOM at batch={n}, retry with chunks {mid}+{n-mid}.",
+                flush=True,
+            )
+            l_logit, l_emb = infer_with_auto_chunk(batch_audio[:mid], min_chunk=min_chunk)
+            r_logit, r_emb = infer_with_auto_chunk(batch_audio[mid:], min_chunk=min_chunk)
+            return (
+                np.concatenate([l_logit, r_logit], axis=0),
+                np.concatenate([l_emb, r_emb], axis=0),
+            )
+
     def flush_batch() -> None:
         if not pending_audio:
             return
         x = np.stack(pending_audio, axis=0).astype(np.float32, copy=False)
-        logits_raw, emb = runner.infer(x)
+        logits_raw, emb = infer_with_auto_chunk(x)
         mapped_scores = np.zeros((len(x), n_classes), dtype=np.float32)
         if len(mapped_pos) > 0:
             mapped_scores[:, mapped_pos] = logits_raw[:, mapped_bc_idx]
