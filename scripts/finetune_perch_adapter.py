@@ -69,7 +69,26 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--lr", type=float, default=3e-4)
     p.add_argument("--weight-decay", type=float, default=1e-4)
     p.add_argument("--hidden-dim", type=int, default=640)
+    p.add_argument(
+        "--hidden-dim2",
+        type=int,
+        default=0,
+        help="Second hidden dim for mlp3_gated. <=0 means auto: max(128, hidden_dim//2).",
+    )
     p.add_argument("--dropout", type=float, default=0.2)
+    p.add_argument(
+        "--adapter-arch",
+        type=str,
+        default="mlp3_gated",
+        choices=["mlp3_gated", "mlp2_legacy"],
+        help="Adapter architecture.",
+    )
+    p.add_argument(
+        "--gate-bias",
+        type=float,
+        default=-2.0,
+        help="Initial bias for sigmoid gate in mlp3_gated.",
+    )
     p.add_argument("--val-ratio", type=float, default=0.15)
     p.add_argument("--include-secondary", action="store_true")
     p.add_argument("--seed", type=int, default=42)
@@ -197,7 +216,7 @@ class PerchRunner:
         return logits, emb
 
 
-class PerchAdapterHead(nn.Module):
+class PerchAdapterHeadLegacy(nn.Module):
     def __init__(self, input_dim: int, hidden_dim: int, output_dim: int, dropout: float):
         super().__init__()
         self.net = nn.Sequential(
@@ -210,6 +229,81 @@ class PerchAdapterHead(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.net(x)
+
+
+class PerchAdapterHeadGated(nn.Module):
+    """3-layer gated residual adapter.
+
+    delta = sigmoid(gate(h2)) * proj(h2)
+    """
+
+    def __init__(
+        self,
+        input_dim: int,
+        hidden_dim: int,
+        hidden_dim2: int,
+        output_dim: int,
+        dropout: float,
+        gate_bias: float = -2.0,
+    ):
+        super().__init__()
+        self.fc1 = nn.Linear(input_dim, hidden_dim)
+        self.norm1 = nn.LayerNorm(hidden_dim)
+        self.fc2 = nn.Linear(hidden_dim, hidden_dim2)
+        self.norm2 = nn.LayerNorm(hidden_dim2)
+        self.delta = nn.Linear(hidden_dim2, output_dim)
+        self.gate = nn.Linear(hidden_dim2, output_dim)
+        self.act = nn.GELU()
+        self.dropout = nn.Dropout(dropout)
+
+        # Start from a conservative adapter and let training learn to amplify.
+        nn.init.zeros_(self.delta.weight)
+        nn.init.zeros_(self.delta.bias)
+        nn.init.zeros_(self.gate.weight)
+        nn.init.constant_(self.gate.bias, float(gate_bias))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        h = self.dropout(self.act(self.norm1(self.fc1(x))))
+        h = self.dropout(self.act(self.norm2(self.fc2(h))))
+        g = torch.sigmoid(self.gate(h))
+        return g * self.delta(h)
+
+
+def build_adapter_model(input_dim: int, output_dim: int, args: argparse.Namespace) -> tuple[nn.Module, dict]:
+    arch = str(args.adapter_arch).strip().lower()
+    if arch == "mlp3_gated":
+        hidden_dim2 = int(args.hidden_dim2) if int(args.hidden_dim2) > 0 else max(128, int(args.hidden_dim) // 2)
+        model = PerchAdapterHeadGated(
+            input_dim=input_dim,
+            hidden_dim=int(args.hidden_dim),
+            hidden_dim2=hidden_dim2,
+            output_dim=output_dim,
+            dropout=float(args.dropout),
+            gate_bias=float(args.gate_bias),
+        )
+        meta = {
+            "adapter_arch": "mlp3_gated",
+            "hidden_dim": int(args.hidden_dim),
+            "hidden_dim2": int(hidden_dim2),
+            "gate_bias": float(args.gate_bias),
+            "dropout": float(args.dropout),
+        }
+        return model, meta
+
+    model = PerchAdapterHeadLegacy(
+        input_dim=input_dim,
+        hidden_dim=int(args.hidden_dim),
+        output_dim=output_dim,
+        dropout=float(args.dropout),
+    )
+    meta = {
+        "adapter_arch": "mlp2_legacy",
+        "hidden_dim": int(args.hidden_dim),
+        "hidden_dim2": 0,
+        "gate_bias": 0.0,
+        "dropout": float(args.dropout),
+    }
+    return model, meta
 
 
 def macro_auc(y_true: np.ndarray, y_score: np.ndarray) -> float:
@@ -269,7 +363,7 @@ def train_adapter(
     groups: np.ndarray,
     args: argparse.Namespace,
     n_classes: int,
-) -> tuple[PerchAdapterHead, float]:
+) -> tuple[nn.Module, float, dict]:
     device = torch.device("cuda" if args.use_gpu and torch.cuda.is_available() else "cpu")
     if args.use_gpu and device.type != "cuda":
         raise RuntimeError("--use-gpu is set, but torch.cuda.is_available() is False.")
@@ -291,12 +385,20 @@ def train_adapter(
     pos_weight = np.clip(neg / (pos + 1.0), 1.0, 50.0)
     pos_weight_t = torch.from_numpy(pos_weight).to(device)
 
-    model = PerchAdapterHead(
+    model, adapter_meta = build_adapter_model(
         input_dim=int(X.shape[1]),
-        hidden_dim=args.hidden_dim,
         output_dim=n_classes,
-        dropout=args.dropout,
-    ).to(device)
+        args=args,
+    )
+    model = model.to(device)
+    print(
+        "[INFO] Adapter arch="
+        f"{adapter_meta['adapter_arch']} "
+        f"(hidden={adapter_meta['hidden_dim']}, "
+        f"hidden2={adapter_meta['hidden_dim2']}, "
+        f"dropout={adapter_meta['dropout']}, "
+        f"gate_bias={adapter_meta['gate_bias']})"
+    )
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 
     best_auc = -1.0
@@ -360,7 +462,7 @@ def train_adapter(
     if best_state is not None:
         model.load_state_dict(best_state, strict=True)
     print(f"[INFO] Adapter training done in {(time.time()-t0)/60:.1f} min | best_val_auc={best_auc:.6f}")
-    return model, best_auc
+    return model, best_auc, adapter_meta
 
 
 def main() -> None:
@@ -526,14 +628,17 @@ def main() -> None:
             )
             print(f"[OK] Saved feature cache: {args.feature_cache}")
 
-    model, best_auc = train_adapter(X, B, Y, G, args, n_classes=n_classes)
+    model, best_auc, adapter_meta = train_adapter(X, B, Y, G, args, n_classes=n_classes)
 
     args.output_ckpt.parent.mkdir(parents=True, exist_ok=True)
     torch.save(
         {
             "adapter_state_dict": model.state_dict(),
+            "adapter_arch": str(adapter_meta.get("adapter_arch", "mlp2_legacy")),
             "input_dim": int(X.shape[1]),
             "hidden_dim": int(args.hidden_dim),
+            "hidden_dim2": int(adapter_meta.get("hidden_dim2", 0)),
+            "gate_bias": float(adapter_meta.get("gate_bias", 0.0)),
             "output_dim": int(n_classes),
             "dropout": float(args.dropout),
             "primary_labels": primary_labels,

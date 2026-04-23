@@ -1062,8 +1062,8 @@ TORCH_DEVICE = torch.device(
 print(f"Torch device: {TORCH_DEVICE}")
 
 
-class PerchAdapterHead(nn.Module):
-    """Small residual adapter that learns a delta on top of Perch logits."""
+class PerchAdapterHeadLegacy(nn.Module):
+    """Legacy 2-layer residual adapter."""
 
     def __init__(
         self,
@@ -1085,6 +1085,43 @@ class PerchAdapterHead(nn.Module):
         return self.net(x)
 
 
+class PerchAdapterHeadGated(nn.Module):
+    """3-layer gated residual adapter.
+
+    delta = sigmoid(gate(h2)) * proj(h2)
+    """
+
+    def __init__(
+        self,
+        input_dim=1536 + 234,
+        hidden_dim=512,
+        hidden_dim2=256,
+        output_dim=234,
+        dropout=0.2,
+        gate_bias=-2.0,
+    ):
+        super().__init__()
+        self.fc1 = nn.Linear(input_dim, hidden_dim)
+        self.norm1 = nn.LayerNorm(hidden_dim)
+        self.fc2 = nn.Linear(hidden_dim, hidden_dim2)
+        self.norm2 = nn.LayerNorm(hidden_dim2)
+        self.delta = nn.Linear(hidden_dim2, output_dim)
+        self.gate = nn.Linear(hidden_dim2, output_dim)
+        self.act = nn.GELU()
+        self.dropout = nn.Dropout(dropout)
+
+        nn.init.zeros_(self.delta.weight)
+        nn.init.zeros_(self.delta.bias)
+        nn.init.zeros_(self.gate.weight)
+        nn.init.constant_(self.gate.bias, float(gate_bias))
+
+    def forward(self, x):
+        h = self.dropout(self.act(self.norm1(self.fc1(x))))
+        h = self.dropout(self.act(self.norm2(self.fc2(h))))
+        g = torch.sigmoid(self.gate(h))
+        return g * self.delta(h)
+
+
 def _sanitize_state_dict_local(state_dict):
     cleaned = {}
     for k, v in state_dict.items():
@@ -1095,6 +1132,21 @@ def _sanitize_state_dict_local(state_dict):
         else:
             cleaned[k] = v
     return cleaned
+
+
+def _detect_adapter_arch_from_ckpt(ckpt):
+    arch = str(ckpt.get("adapter_arch", "")).strip().lower()
+    if arch:
+        return arch
+    state_keys = list(ckpt.get("adapter_state_dict", {}).keys())
+    has_gated_keys = any(
+        k.startswith("fc1.")
+        or k.startswith("fc2.")
+        or k.startswith("delta.")
+        or k.startswith("gate.")
+        for k in state_keys
+    )
+    return "mlp3_gated" if has_gated_keys else "mlp2_legacy"
 
 
 def _load_perch_adapter_from_env():
@@ -1112,19 +1164,37 @@ def _load_perch_adapter_from_env():
             "Perch adapter label space mismatch with current sample_submission."
         )
 
-    model = PerchAdapterHead(
-        input_dim=int(ckpt.get("input_dim", 1536 + N_CLASSES)),
-        hidden_dim=int(ckpt.get("hidden_dim", 512)),
-        output_dim=int(ckpt.get("output_dim", N_CLASSES)),
-        dropout=float(ckpt.get("dropout", 0.2)),
-    ).to(TORCH_DEVICE)
-    model.load_state_dict(
-        _sanitize_state_dict_local(ckpt["adapter_state_dict"]), strict=True
-    )
+    arch = _detect_adapter_arch_from_ckpt(ckpt)
+    input_dim = int(ckpt.get("input_dim", 1536 + N_CLASSES))
+    hidden_dim = int(ckpt.get("hidden_dim", 512))
+    output_dim = int(ckpt.get("output_dim", N_CLASSES))
+    dropout = float(ckpt.get("dropout", 0.2))
+    hidden_dim2 = int(ckpt.get("hidden_dim2", max(128, hidden_dim // 2)))
+    gate_bias = float(ckpt.get("gate_bias", -2.0))
+
+    if arch == "mlp3_gated":
+        model = PerchAdapterHeadGated(
+            input_dim=input_dim,
+            hidden_dim=hidden_dim,
+            hidden_dim2=hidden_dim2,
+            output_dim=output_dim,
+            dropout=dropout,
+            gate_bias=gate_bias,
+        ).to(TORCH_DEVICE)
+    else:
+        arch = "mlp2_legacy"
+        model = PerchAdapterHeadLegacy(
+            input_dim=input_dim,
+            hidden_dim=hidden_dim,
+            output_dim=output_dim,
+            dropout=dropout,
+        ).to(TORCH_DEVICE)
+
+    model.load_state_dict(_sanitize_state_dict_local(ckpt["adapter_state_dict"]), strict=True)
     model.eval()
     print(
         f"[OK] Loaded Perch adapter: {ckpt_path} "
-        f"(hidden={ckpt.get('hidden_dim', 512)}, weight={PERCH_ADAPTER_WEIGHT})"
+        f"(arch={arch}, hidden={hidden_dim}, hidden2={hidden_dim2}, weight={PERCH_ADAPTER_WEIGHT})"
     )
     return model
 
