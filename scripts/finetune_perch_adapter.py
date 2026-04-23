@@ -132,10 +132,15 @@ class PerchRunner:
             providers = ["CPUExecutionProvider"]
             try:
                 avail = ort.get_available_providers()
-                if use_gpu and "CUDAExecutionProvider" in avail:
+                if use_gpu:
+                    if "CUDAExecutionProvider" not in avail:
+                        raise RuntimeError(
+                            f"--use-gpu is set, but onnxruntime has no CUDAExecutionProvider. "
+                            f"Available providers: {avail}"
+                        )
                     providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
             except Exception:
-                providers = ["CPUExecutionProvider"]
+                raise
             sess_opt = ort.SessionOptions()
             sess_opt.intra_op_num_threads = 4
             self.session = ort.InferenceSession(str(onnx_path), sess_options=sess_opt, providers=providers)
@@ -237,6 +242,8 @@ def train_adapter(
     n_classes: int,
 ) -> tuple[PerchAdapterHead, float]:
     device = torch.device("cuda" if args.use_gpu and torch.cuda.is_available() else "cpu")
+    if args.use_gpu and device.type != "cuda":
+        raise RuntimeError("--use-gpu is set, but torch.cuda.is_available() is False.")
     print(f"[INFO] Adapter train device: {device}")
 
     unique_files = np.unique(groups)
