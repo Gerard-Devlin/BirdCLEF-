@@ -80,7 +80,7 @@ def parse_args() -> argparse.Namespace:
         "--adapter-arch",
         type=str,
         default="mlp3_gated",
-        choices=["mlp3_gated", "mlp2_legacy"],
+        choices=["linear", "mlp3_gated", "mlp2_legacy"],
         help="Adapter architecture.",
     )
     p.add_argument(
@@ -231,6 +231,21 @@ class PerchAdapterHeadLegacy(nn.Module):
         return self.net(x)
 
 
+class PerchAdapterHeadLinear(nn.Module):
+    """Single-layer linear residual adapter."""
+
+    def __init__(self, input_dim: int, output_dim: int):
+        super().__init__()
+        self.linear = nn.Linear(input_dim, output_dim)
+
+        # Conservative init: start near identity-over-base (tiny delta), then learn.
+        nn.init.zeros_(self.linear.weight)
+        nn.init.zeros_(self.linear.bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.linear(x)
+
+
 class PerchAdapterHeadGated(nn.Module):
     """3-layer gated residual adapter.
 
@@ -271,6 +286,20 @@ class PerchAdapterHeadGated(nn.Module):
 
 def build_adapter_model(input_dim: int, output_dim: int, args: argparse.Namespace) -> tuple[nn.Module, dict]:
     arch = str(args.adapter_arch).strip().lower()
+    if arch == "linear":
+        model = PerchAdapterHeadLinear(
+            input_dim=input_dim,
+            output_dim=output_dim,
+        )
+        meta = {
+            "adapter_arch": "linear",
+            "hidden_dim": 0,
+            "hidden_dim2": 0,
+            "gate_bias": 0.0,
+            "dropout": 0.0,
+        }
+        return model, meta
+
     if arch == "mlp3_gated":
         hidden_dim2 = int(args.hidden_dim2) if int(args.hidden_dim2) > 0 else max(128, int(args.hidden_dim) // 2)
         model = PerchAdapterHeadGated(
@@ -636,7 +665,7 @@ def main() -> None:
             "adapter_state_dict": model.state_dict(),
             "adapter_arch": str(adapter_meta.get("adapter_arch", "mlp2_legacy")),
             "input_dim": int(X.shape[1]),
-            "hidden_dim": int(args.hidden_dim),
+            "hidden_dim": int(adapter_meta.get("hidden_dim", args.hidden_dim)),
             "hidden_dim2": int(adapter_meta.get("hidden_dim2", 0)),
             "gate_bias": float(adapter_meta.get("gate_bias", 0.0)),
             "output_dim": int(n_classes),

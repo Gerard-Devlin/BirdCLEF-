@@ -1085,6 +1085,24 @@ class PerchAdapterHeadLegacy(nn.Module):
         return self.net(x)
 
 
+class PerchAdapterHeadLinear(nn.Module):
+    """Single-layer linear residual adapter."""
+
+    def __init__(
+        self,
+        input_dim=1536 + 234,
+        output_dim=234,
+    ):
+        super().__init__()
+        self.linear = nn.Linear(input_dim, output_dim)
+
+        nn.init.zeros_(self.linear.weight)
+        nn.init.zeros_(self.linear.bias)
+
+    def forward(self, x):
+        return self.linear(x)
+
+
 class PerchAdapterHeadGated(nn.Module):
     """3-layer gated residual adapter.
 
@@ -1139,6 +1157,9 @@ def _detect_adapter_arch_from_ckpt(ckpt):
     if arch:
         return arch
     state_keys = list(ckpt.get("adapter_state_dict", {}).keys())
+    has_linear_keys = any(k.startswith("linear.") for k in state_keys)
+    if has_linear_keys:
+        return "linear"
     has_gated_keys = any(
         k.startswith("fc1.")
         or k.startswith("fc2.")
@@ -1172,7 +1193,12 @@ def _load_perch_adapter_from_env():
     hidden_dim2 = int(ckpt.get("hidden_dim2", max(128, hidden_dim // 2)))
     gate_bias = float(ckpt.get("gate_bias", -2.0))
 
-    if arch == "mlp3_gated":
+    if arch == "linear":
+        model = PerchAdapterHeadLinear(
+            input_dim=input_dim,
+            output_dim=output_dim,
+        ).to(TORCH_DEVICE)
+    elif arch == "mlp3_gated":
         model = PerchAdapterHeadGated(
             input_dim=input_dim,
             hidden_dim=hidden_dim,
