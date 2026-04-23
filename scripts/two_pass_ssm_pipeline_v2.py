@@ -254,6 +254,7 @@ DISABLE_EARLY_STOP = _env_bool("BC26_DISABLE_EARLY_STOP", False)
 GLOBAL_SEED = _env_int("BC26_SEED", 42)
 PERCH_ADAPTER_CKPT_RAW = os.environ.get("BC26_PERCH_ADAPTER_CKPT", "").strip()
 PERCH_ADAPTER_WEIGHT = _env_float("BC26_PERCH_ADAPTER_WEIGHT", 1.0)
+PERCH_ADAPTER_MODEL = None
 
 np.random.seed(GLOBAL_SEED)
 random.seed(GLOBAL_SEED)
@@ -1117,6 +1118,18 @@ def _apply_perch_adapter(scores_raw, emb_raw, adapter_model, weight=1.0, batch_s
 
 
 PERCH_ADAPTER_MODEL = _load_perch_adapter_from_env()
+if PERCH_ADAPTER_MODEL is not None and "sc_tr" in globals() and "emb_tr" in globals():
+    t0 = time.time()
+    sc_tr = _apply_perch_adapter(
+        sc_tr,
+        emb_tr,
+        PERCH_ADAPTER_MODEL,
+        weight=PERCH_ADAPTER_WEIGHT,
+    )
+    print(
+        f"[OK] Applied Perch adapter to training cache in {time.time()-t0:.1f}s "
+        f"| score range [{sc_tr.min():.3f}, {sc_tr.max():.3f}]"
+    )
 
 class VectorizedMLPProbes(nn.Module):
     """Stacks all per-class MLP weights into a single batched PyTorch model.
