@@ -23,6 +23,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--work-dir", default="/kaggle/working/cache", help="Working/cache directory.")
     parser.add_argument("--onnx-path", default="", help="Optional Perch ONNX path.")
     parser.add_argument("--extra-cache-dirs", default="", help="Optional extra cache dirs (os.pathsep separated).")
+    parser.add_argument("--perch-adapter", default="", help="Optional Perch adapter ckpt (.pth).")
+    parser.add_argument("--perch-adapter-weight", type=float, default=1.0, help="Adapter delta weight.")
     parser.add_argument("--input-root", default="/kaggle/input", help="Root path for wheel auto-discovery.")
     parser.add_argument(
         "--pipeline-script",
@@ -51,6 +53,9 @@ def main() -> None:
         env["BC26_ONNX_PATH"] = str(Path(args.onnx_path))
     if args.extra_cache_dirs:
         env["BC26_EXTRA_CACHE_DIRS"] = args.extra_cache_dirs
+    if args.perch_adapter:
+        env["BC26_PERCH_ADAPTER_CKPT"] = str(Path(args.perch_adapter))
+        env["BC26_PERCH_ADAPTER_WEIGHT"] = str(float(args.perch_adapter_weight))
 
     cmd = [sys.executable, str(pipeline_script)]
     print("Running:", " ".join(cmd))
@@ -59,4 +64,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

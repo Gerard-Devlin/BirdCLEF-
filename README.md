@@ -14,6 +14,8 @@ You need these assets:
 1. Competition data (`birdclef-2026`)
     - `taxonomy.csv`
     - `sample_submission.csv`
+    - `train.csv`
+    - `train_audio/*.ogg`
     - `train_soundscapes_labels.csv`
     - `train_soundscapes/*.ogg`
     - `test_soundscapes/*.ogg` (for real submit rerun)
@@ -37,6 +39,8 @@ You need these assets:
 - `BC26_EXTRA_CACHE_DIRS`: extra cache dirs separated by `:` on Linux or `;` on Windows
 - `BC26_CKPT_PATH`: optional pipeline ckpt path (save when training, load when exists)
 - `BC26_USE_GPU`: `1` to prefer GPU for torch/onnxruntime, `0` to force CPU
+- `BC26_PERCH_ADAPTER_CKPT`: optional adapter ckpt trained from `train_audio`
+- `BC26_PERCH_ADAPTER_WEIGHT`: adapter delta weight (default `1.0`)
 
 ### Optional Tunables (env vars)
 
@@ -67,6 +71,42 @@ python scripts/two_pass_ssm_pipeline_v2.py
 ```
 
 After this run, `BC26_CKPT_PATH` is your offline fine-tuned checkpoint bundle.
+
+## 16G `train_audio` Perch Adapter Fine-Tune (Recommended)
+
+Train an adapter on full `train_audio` weak labels (`train.csv`) and inject it into two-pass:
+
+```bash
+cd ~/birdclef+
+conda activate birdclef
+ROOT="$PWD"
+mkdir -p "$ROOT/work/adapter" "$ROOT/logs"
+
+nohup env PYTHONNOUSERSITE=1 python scripts/finetune_perch_adapter.py \
+  --train-csv "$ROOT/dataset/train.csv" \
+  --audio-dir "$ROOT/dataset/train_audio" \
+  --taxonomy-csv "$ROOT/dataset/taxonomy.csv" \
+  --sample-submission-csv "$ROOT/dataset/sample_submission.csv" \
+  --model-dir "$ROOT/models/bird-vocalization-classifier-tensorflow2-perch_v2_cpu-v1" \
+  --onnx-path "$ROOT/source/Perch-onnx-for-birdclef+2026/perch_v2.onnx" \
+  --output-ckpt "$ROOT/work/adapter/perch_adapter_v1.pth" \
+  --segments-per-file 2 \
+  --epochs 8 \
+  --patience 3 \
+  --hidden-dim 640 \
+  --dropout 0.2 \
+  --seed 42 \
+  --use-gpu \
+  > "$ROOT/logs/finetune_perch_adapter_v1.log" 2>&1 &
+```
+
+Then run your two-pass training with adapter enabled:
+
+```bash
+BC26_PERCH_ADAPTER_CKPT="$ROOT/work/adapter/perch_adapter_v1.pth" \
+BC26_PERCH_ADAPTER_WEIGHT=1.0 \
+python scripts/two_pass_ssm_pipeline_v2.py
+```
 
 ## Server Training Command (nohup)
 
@@ -140,6 +180,8 @@ mkdir -p "$BUNDLE_DIR/scripts"
 cp "$ROOT/scripts/infer_pt.py" "$BUNDLE_DIR/scripts/"
 cp "$ROOT/scripts/two_pass_ssm_pipeline_v2.py" "$BUNDLE_DIR/scripts/"
 cp "$CKPT_SRC" "$BUNDLE_DIR/checkpoint.pth"
+# Optional: include adapter if used during two-pass train/infer
+# cp "$ROOT/work/adapter/perch_adapter_v1.pth" "$BUNDLE_DIR/perch_adapter.pth"
 
 tar -czf "$TAR_PATH" -C "$ROOT/build" "$BUNDLE_TAG"
 ls -lh "$TAR_PATH"
@@ -175,6 +217,13 @@ Notebook Cell 2 (inference only):
   --onnx-path {onnx_path} \
   --extra-cache-dirs {extra_cache_dirs} \
   --output /kaggle/working/submission.csv
+```
+
+If your bundle also contains adapter ckpt, add:
+
+```python
+  --perch-adapter {bundle_root}/perch_adapter.pth \
+  --perch-adapter-weight 1.0 \
 ```
 
 The notebook version must output `/kaggle/working/submission.csv`.

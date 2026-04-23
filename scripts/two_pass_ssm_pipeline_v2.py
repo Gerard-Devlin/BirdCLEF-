@@ -252,6 +252,8 @@ TUNE = {
 
 DISABLE_EARLY_STOP = _env_bool("BC26_DISABLE_EARLY_STOP", False)
 GLOBAL_SEED = _env_int("BC26_SEED", 42)
+PERCH_ADAPTER_CKPT_RAW = os.environ.get("BC26_PERCH_ADAPTER_CKPT", "").strip()
+PERCH_ADAPTER_WEIGHT = _env_float("BC26_PERCH_ADAPTER_WEIGHT", 1.0)
 
 np.random.seed(GLOBAL_SEED)
 random.seed(GLOBAL_SEED)
@@ -263,6 +265,11 @@ print(f"  n_epochs={CFG['proto_ssm_train']['n_epochs']}  "
       f"oof_n_splits={CFG['proto_ssm_train']['oof_n_splits']}  "
       f"mlp_max_iter={CFG['mlp_params']['max_iter']}")
 print(f"  seed={GLOBAL_SEED}")
+if PERCH_ADAPTER_CKPT_RAW:
+    print(
+        f"  perch_adapter_ckpt={PERCH_ADAPTER_CKPT_RAW} "
+        f"(weight={PERCH_ADAPTER_WEIGHT})"
+    )
  
 print("Config ready")
 print(f"  run_oof={CFG['run_oof']}  verbose={CFG['verbose']}  dryrun={CFG['dryrun_n_files']}")
@@ -687,6 +694,19 @@ if len(meta_tr) != expected_rows:
 print(f"sc_tr: {sc_tr.shape}  emb_tr: {emb_tr.shape}  "
       f"Y_FULL_aligned: {Y_FULL_aligned.shape}")
 
+if PERCH_ADAPTER_MODEL is not None:
+    t0 = time.time()
+    sc_tr = _apply_perch_adapter(
+        sc_tr,
+        emb_tr,
+        PERCH_ADAPTER_MODEL,
+        weight=PERCH_ADAPTER_WEIGHT,
+    )
+    print(
+        f"[OK] Applied Perch adapter to training cache in {time.time()-t0:.1f}s "
+        f"| score range [{sc_tr.min():.3f}, {sc_tr.max():.3f}]"
+    )
+
 # ===== Cell 9 =====
 # Competition metric (macro ROC-AUC over classes with at least one positive)
 # and an honest GroupKFold OOF evaluator that never splits a file across folds.
@@ -1012,6 +1032,91 @@ TORCH_DEVICE = torch.device(
     "cuda" if (USE_GPU and torch.cuda.is_available()) else "cpu"
 )
 print(f"Torch device: {TORCH_DEVICE}")
+
+
+class PerchAdapterHead(nn.Module):
+    """Small residual adapter that learns a delta on top of Perch logits."""
+
+    def __init__(
+        self,
+        input_dim=1536 + 234,
+        hidden_dim=512,
+        output_dim=234,
+        dropout=0.2,
+    ):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, output_dim),
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+
+def _sanitize_state_dict_local(state_dict):
+    cleaned = {}
+    for k, v in state_dict.items():
+        if k == "n_averaged":
+            continue
+        if k.startswith("module."):
+            cleaned[k[len("module."):]] = v
+        else:
+            cleaned[k] = v
+    return cleaned
+
+
+def _load_perch_adapter_from_env():
+    if not PERCH_ADAPTER_CKPT_RAW:
+        return None
+    ckpt_path = Path(PERCH_ADAPTER_CKPT_RAW)
+    if not ckpt_path.exists():
+        print(f"[WARN] Perch adapter ckpt not found: {ckpt_path}. Skip adapter.")
+        return None
+
+    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    ckpt_labels = ckpt.get("primary_labels")
+    if ckpt_labels is not None and list(ckpt_labels) != list(PRIMARY_LABELS):
+        raise RuntimeError(
+            "Perch adapter label space mismatch with current sample_submission."
+        )
+
+    model = PerchAdapterHead(
+        input_dim=int(ckpt.get("input_dim", 1536 + N_CLASSES)),
+        hidden_dim=int(ckpt.get("hidden_dim", 512)),
+        output_dim=int(ckpt.get("output_dim", N_CLASSES)),
+        dropout=float(ckpt.get("dropout", 0.2)),
+    ).to(TORCH_DEVICE)
+    model.load_state_dict(
+        _sanitize_state_dict_local(ckpt["adapter_state_dict"]), strict=True
+    )
+    model.eval()
+    print(
+        f"[OK] Loaded Perch adapter: {ckpt_path} "
+        f"(hidden={ckpt.get('hidden_dim', 512)}, weight={PERCH_ADAPTER_WEIGHT})"
+    )
+    return model
+
+
+def _apply_perch_adapter(scores_raw, emb_raw, adapter_model, weight=1.0, batch_size=2048):
+    if adapter_model is None or abs(weight) < 1e-12:
+        return scores_raw
+    feat = np.concatenate([emb_raw, scores_raw], axis=1).astype(np.float32, copy=False)
+    out = np.empty_like(scores_raw, dtype=np.float32)
+    n = len(feat)
+    for i in range(0, n, batch_size):
+        j = min(n, i + batch_size)
+        x = torch.from_numpy(feat[i:j]).to(TORCH_DEVICE)
+        with torch.no_grad():
+            delta = adapter_model(x).detach().cpu().numpy().astype(np.float32)
+        out[i:j] = scores_raw[i:j] + float(weight) * delta
+    return out
+
+
+PERCH_ADAPTER_MODEL = _load_perch_adapter_from_env()
 
 class VectorizedMLPProbes(nn.Module):
     """Stacks all per-class MLP weights into a single batched PyTorch model.
@@ -2039,6 +2144,18 @@ else:
  
 meta_te, sc_te, emb_te = run_perch(test_paths, CFG["batch_files"], verbose=CFG["verbose"])
 print(f"Test scores: {sc_te.shape}")
+if PERCH_ADAPTER_MODEL is not None:
+    t0 = time.time()
+    sc_te = _apply_perch_adapter(
+        sc_te,
+        emb_te,
+        PERCH_ADAPTER_MODEL,
+        weight=PERCH_ADAPTER_WEIGHT,
+    )
+    print(
+        f"[OK] Applied Perch adapter to test scores in {time.time()-t0:.1f}s "
+        f"| score range [{sc_te.min():.3f}, {sc_te.max():.3f}]"
+    )
 
 # ===== Cell 25 =====
 # Full inference pipeline:
@@ -2269,6 +2386,8 @@ else:
                 "temperatures": temperatures.astype(np.float32),
                 "per_class_thresholds": PER_CLASS_THRESHOLDS.astype(np.float32),
                 "tune": dict(TUNE),
+                "perch_adapter_ckpt": PERCH_ADAPTER_CKPT_RAW,
+                "perch_adapter_weight": float(PERCH_ADAPTER_WEIGHT),
             },
             CKPT_PATH,
         )
