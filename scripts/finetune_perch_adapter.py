@@ -52,7 +52,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--taxonomy-csv", type=Path, default=Path("dataset/taxonomy.csv"))
     p.add_argument("--sample-submission-csv", type=Path, default=Path("dataset/sample_submission.csv"))
     p.add_argument("--model-dir", type=Path, required=True, help="Perch SavedModel dir (contains assets/labels.csv).")
-    p.add_argument("--onnx-path", type=Path, default=Path(""), help="Optional Perch ONNX model path.")
+    p.add_argument("--onnx-path", type=Path, default=None, help="Optional Perch ONNX model path.")
     p.add_argument("--output-ckpt", type=Path, required=True)
     p.add_argument("--segments-per-file", type=int, default=2)
     p.add_argument("--max-files", type=int, default=0, help="0 means all files.")
@@ -380,7 +380,12 @@ def main() -> None:
 
     print(f"[INFO] train rows with valid labels: {len(train_df)}")
 
-    runner = PerchRunner(args.model_dir, args.onnx_path if str(args.onnx_path) else None, args.use_gpu)
+    onnx_path = None
+    if args.onnx_path is not None:
+        raw = str(args.onnx_path).strip()
+        if raw and raw != ".":
+            onnx_path = args.onnx_path
+    runner = PerchRunner(args.model_dir, onnx_path, args.use_gpu)
 
     pending_audio: List[np.ndarray] = []
     pending_targets: List[np.ndarray] = []
