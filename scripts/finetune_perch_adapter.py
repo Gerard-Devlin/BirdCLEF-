@@ -54,6 +54,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--model-dir", type=Path, required=True, help="Perch SavedModel dir (contains assets/labels.csv).")
     p.add_argument("--onnx-path", type=Path, default=None, help="Optional Perch ONNX model path.")
     p.add_argument("--output-ckpt", type=Path, required=True)
+    p.add_argument(
+        "--feature-cache",
+        type=Path,
+        default=None,
+        help="Optional .npz cache for extracted features. If exists, skip extract.",
+    )
     p.add_argument("--segments-per-file", type=int, default=2)
     p.add_argument("--max-files", type=int, default=0, help="0 means all files.")
     p.add_argument("--batch-size", type=int, default=256, help="Perch forward batch size.")
@@ -391,106 +397,134 @@ def main() -> None:
         raw = str(args.onnx_path).strip()
         if raw and raw != ".":
             onnx_path = args.onnx_path
-    runner = PerchRunner(args.model_dir, onnx_path, args.use_gpu)
-
-    pending_audio: List[np.ndarray] = []
-    pending_targets: List[np.ndarray] = []
-    pending_groups: List[int] = []
-
-    feats_all = []
-    base_all = []
-    y_all = []
-    groups_all: List[int] = []
-
-    def infer_with_auto_chunk(batch_audio: np.ndarray, min_chunk: int = 4) -> tuple[np.ndarray, np.ndarray]:
-        """Run Perch inference with OOM-aware chunk fallback."""
-        try:
-            return runner.infer(batch_audio)
-        except Exception as e:
-            msg = str(e).lower()
-            oom_like = (
-                "failed to allocate memory" in msg
-                or "cuda out of memory" in msg
-                or "bfc_arena" in msg
+    cache_loaded = False
+    if args.feature_cache is not None and args.feature_cache.exists():
+        arr = np.load(args.feature_cache)
+        X = arr["X"].astype(np.float32, copy=False)
+        B = arr["B"].astype(np.float32, copy=False)
+        Y = arr["Y"].astype(np.float32, copy=False)
+        G = arr["G"].astype(np.int32, copy=False)
+        if Y.shape[1] != n_classes:
+            raise RuntimeError(
+                f"Feature cache label dim {Y.shape[1]} does not match current n_classes {n_classes}."
             )
-            if (not oom_like) or len(batch_audio) <= min_chunk:
-                raise
+        cache_loaded = True
+        print(
+            f"[INFO] Loaded feature cache: {args.feature_cache} | "
+            f"windows={len(X)} files={len(np.unique(G))} feature_dim={X.shape[1]}"
+        )
 
-            n = len(batch_audio)
-            mid = n // 2
-            print(
-                f"[WARN] OOM at batch={n}, retry with chunks {mid}+{n-mid}.",
-                flush=True,
+    if not cache_loaded:
+        runner = PerchRunner(args.model_dir, onnx_path, args.use_gpu)
+
+        pending_audio: List[np.ndarray] = []
+        pending_targets: List[np.ndarray] = []
+        pending_groups: List[int] = []
+
+        feats_all = []
+        base_all = []
+        y_all = []
+        groups_all: List[int] = []
+
+        def infer_with_auto_chunk(batch_audio: np.ndarray, min_chunk: int = 4) -> tuple[np.ndarray, np.ndarray]:
+            """Run Perch inference with OOM-aware chunk fallback."""
+            try:
+                return runner.infer(batch_audio)
+            except Exception as e:
+                msg = str(e).lower()
+                oom_like = (
+                    "failed to allocate memory" in msg
+                    or "cuda out of memory" in msg
+                    or "bfc_arena" in msg
+                )
+                if (not oom_like) or len(batch_audio) <= min_chunk:
+                    raise
+
+                n = len(batch_audio)
+                mid = n // 2
+                print(
+                    f"[WARN] OOM at batch={n}, retry with chunks {mid}+{n-mid}.",
+                    flush=True,
+                )
+                l_logit, l_emb = infer_with_auto_chunk(batch_audio[:mid], min_chunk=min_chunk)
+                r_logit, r_emb = infer_with_auto_chunk(batch_audio[mid:], min_chunk=min_chunk)
+                return (
+                    np.concatenate([l_logit, r_logit], axis=0),
+                    np.concatenate([l_emb, r_emb], axis=0),
+                )
+
+        def flush_batch() -> None:
+            if not pending_audio:
+                return
+            x = np.stack(pending_audio, axis=0).astype(np.float32, copy=False)
+            logits_raw, emb = infer_with_auto_chunk(x)
+            mapped_scores = np.zeros((len(x), n_classes), dtype=np.float32)
+            if len(mapped_pos) > 0:
+                mapped_scores[:, mapped_pos] = logits_raw[:, mapped_bc_idx]
+            feat = np.concatenate([emb, mapped_scores], axis=1).astype(np.float32, copy=False)
+            feats_all.append(feat)
+            base_all.append(mapped_scores)
+            y_all.append(np.stack(pending_targets, axis=0).astype(np.float32, copy=False))
+            groups_all.extend(pending_groups)
+            pending_audio.clear()
+            pending_targets.clear()
+            pending_groups.clear()
+
+        skipped = 0
+        total_windows = 0
+        file_list = train_df["filename"].astype(str).tolist()
+        label_list = train_df["__labels"].tolist()
+        pbar = tqdm(
+            enumerate(zip(file_list, label_list)),
+            total=len(file_list),
+            desc="Extract",
+        )
+        for file_idx, (rel, labels_for_row) in pbar:
+            path = args.audio_dir / rel
+            if not path.exists():
+                skipped += 1
+                continue
+            try:
+                y = load_audio_mono_32k(path)
+                windows = extract_windows(y, args.segments_per_file)
+            except Exception:
+                skipped += 1
+                continue
+            target = np.zeros(n_classes, dtype=np.float32)
+            for lbl in labels_for_row:
+                target[label_to_idx[lbl]] = 1.0
+            for w in windows:
+                pending_audio.append(w)
+                pending_targets.append(target)
+                pending_groups.append(file_idx)
+                total_windows += 1
+                if len(pending_audio) >= args.batch_size:
+                    flush_batch()
+            pbar.set_postfix(windows=total_windows, skipped=skipped)
+        flush_batch()
+
+        if not feats_all:
+            raise RuntimeError("No features extracted. Check dataset paths / sample rate.")
+
+        X = np.concatenate(feats_all, axis=0)
+        B = np.concatenate(base_all, axis=0)
+        Y = np.concatenate(y_all, axis=0)
+        G = np.asarray(groups_all, dtype=np.int32)
+
+        print(
+            f"[INFO] Extracted windows={len(X)} | files={len(np.unique(G))} | "
+            f"feature_dim={X.shape[1]} | labels={Y.shape[1]} | skipped_files={skipped}"
+        )
+        if args.feature_cache is not None:
+            args.feature_cache.parent.mkdir(parents=True, exist_ok=True)
+            np.savez_compressed(
+                args.feature_cache,
+                X=X.astype(np.float32),
+                B=B.astype(np.float32),
+                Y=Y.astype(np.float32),
+                G=G.astype(np.int32),
             )
-            l_logit, l_emb = infer_with_auto_chunk(batch_audio[:mid], min_chunk=min_chunk)
-            r_logit, r_emb = infer_with_auto_chunk(batch_audio[mid:], min_chunk=min_chunk)
-            return (
-                np.concatenate([l_logit, r_logit], axis=0),
-                np.concatenate([l_emb, r_emb], axis=0),
-            )
-
-    def flush_batch() -> None:
-        if not pending_audio:
-            return
-        x = np.stack(pending_audio, axis=0).astype(np.float32, copy=False)
-        logits_raw, emb = infer_with_auto_chunk(x)
-        mapped_scores = np.zeros((len(x), n_classes), dtype=np.float32)
-        if len(mapped_pos) > 0:
-            mapped_scores[:, mapped_pos] = logits_raw[:, mapped_bc_idx]
-        feat = np.concatenate([emb, mapped_scores], axis=1).astype(np.float32, copy=False)
-        feats_all.append(feat)
-        base_all.append(mapped_scores)
-        y_all.append(np.stack(pending_targets, axis=0).astype(np.float32, copy=False))
-        groups_all.extend(pending_groups)
-        pending_audio.clear()
-        pending_targets.clear()
-        pending_groups.clear()
-
-    skipped = 0
-    total_windows = 0
-    file_list = train_df["filename"].astype(str).tolist()
-    label_list = train_df["__labels"].tolist()
-    pbar = tqdm(
-        enumerate(zip(file_list, label_list)),
-        total=len(file_list),
-        desc="Extract",
-    )
-    for file_idx, (rel, labels_for_row) in pbar:
-        path = args.audio_dir / rel
-        if not path.exists():
-            skipped += 1
-            continue
-        try:
-            y = load_audio_mono_32k(path)
-            windows = extract_windows(y, args.segments_per_file)
-        except Exception:
-            skipped += 1
-            continue
-        target = np.zeros(n_classes, dtype=np.float32)
-        for lbl in labels_for_row:
-            target[label_to_idx[lbl]] = 1.0
-        for w in windows:
-            pending_audio.append(w)
-            pending_targets.append(target)
-            pending_groups.append(file_idx)
-            total_windows += 1
-            if len(pending_audio) >= args.batch_size:
-                flush_batch()
-        pbar.set_postfix(windows=total_windows, skipped=skipped)
-    flush_batch()
-
-    if not feats_all:
-        raise RuntimeError("No features extracted. Check dataset paths / sample rate.")
-
-    X = np.concatenate(feats_all, axis=0)
-    B = np.concatenate(base_all, axis=0)
-    Y = np.concatenate(y_all, axis=0)
-    G = np.asarray(groups_all, dtype=np.int32)
-
-    print(
-        f"[INFO] Extracted windows={len(X)} | files={len(np.unique(G))} | "
-        f"feature_dim={X.shape[1]} | labels={Y.shape[1]} | skipped_files={skipped}"
-    )
+            print(f"[OK] Saved feature cache: {args.feature_cache}")
 
     model, best_auc = train_adapter(X, B, Y, G, args, n_classes=n_classes)
 
