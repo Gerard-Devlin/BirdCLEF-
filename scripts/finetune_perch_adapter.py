@@ -154,7 +154,13 @@ class PerchRunner:
                 self.input_name = self.session.get_inputs()[0].name
                 self.out_map = {o.name: i for i, o in enumerate(self.session.get_outputs())}
                 self.use_onnx = True
-                print(f"[INFO] Using ONNX Perch | providers={self.session.get_providers()}")
+                active_providers = self.session.get_providers()
+                if use_gpu and "CUDAExecutionProvider" not in active_providers:
+                    raise RuntimeError(
+                        "--use-gpu is set, but ONNX session did not activate CUDAExecutionProvider. "
+                        f"Active providers: {active_providers}"
+                    )
+                print(f"[INFO] Using ONNX Perch | providers={active_providers}")
                 return
             except Exception as e:
                 print(f"[WARN] ONNX session init failed: {e}")
