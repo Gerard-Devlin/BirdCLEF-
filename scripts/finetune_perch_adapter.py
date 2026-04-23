@@ -142,19 +142,36 @@ class PerchRunner:
             except Exception:
                 raise
             sess_opt = ort.SessionOptions()
-            sess_opt.intra_op_num_threads = 4
-            self.session = ort.InferenceSession(str(onnx_path), sess_options=sess_opt, providers=providers)
-            self.input_name = self.session.get_inputs()[0].name
-            self.out_map = {o.name: i for i, o in enumerate(self.session.get_outputs())}
-            self.use_onnx = True
-            print(f"[INFO] Using ONNX Perch | providers={self.session.get_providers()}")
+            # Avoid noisy pthread_setaffinity_np warnings on some cluster schedulers.
+            sess_opt.intra_op_num_threads = 1
+            sess_opt.inter_op_num_threads = 1
+            try:
+                self.session = ort.InferenceSession(
+                    str(onnx_path),
+                    sess_options=sess_opt,
+                    providers=providers,
+                )
+                self.input_name = self.session.get_inputs()[0].name
+                self.out_map = {o.name: i for i, o in enumerate(self.session.get_outputs())}
+                self.use_onnx = True
+                print(f"[INFO] Using ONNX Perch | providers={self.session.get_providers()}")
+                return
+            except Exception as e:
+                print(f"[WARN] ONNX session init failed: {e}")
+                if tf is None:
+                    raise RuntimeError(
+                        "ONNX load failed and TensorFlow is unavailable. "
+                        "Try a compatible ONNX model/runtime pair."
+                    ) from e
+                print("[WARN] Falling back to TensorFlow SavedModel Perch.")
         else:
             if tf is None:
                 raise RuntimeError("Neither ONNX path provided nor TensorFlow available.")
-            birdclassifier = tf.saved_model.load(str(model_dir))
-            self.infer_fn = birdclassifier.signatures["serving_default"]
-            self.use_onnx = False
-            print("[INFO] Using TensorFlow SavedModel Perch")
+
+        birdclassifier = tf.saved_model.load(str(model_dir))
+        self.infer_fn = birdclassifier.signatures["serving_default"]
+        self.use_onnx = False
+        print("[INFO] Using TensorFlow SavedModel Perch")
 
     def infer(self, batch_audio: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         if self.use_onnx:
