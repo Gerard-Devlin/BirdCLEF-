@@ -254,7 +254,13 @@ DISABLE_EARLY_STOP = _env_bool("BC26_DISABLE_EARLY_STOP", False)
 GLOBAL_SEED = _env_int("BC26_SEED", 42)
 DISABLE_GENUS_PROXY = _env_bool("BC26_DISABLE_GENUS_PROXY", False)
 PERCH_ADAPTER_CKPT_RAW = os.environ.get("BC26_PERCH_ADAPTER_CKPT", "").strip()
-PERCH_ADAPTER_WEIGHT = _env_float("BC26_PERCH_ADAPTER_WEIGHT", 1.0)
+PERCH_ADAPTER_WEIGHT_RAW = os.environ.get("BC26_PERCH_ADAPTER_WEIGHT", "1.0").strip()
+PERCH_ADAPTER_WEIGHT_AUTO = PERCH_ADAPTER_WEIGHT_RAW.lower() in {"auto", "cv", "soundscape"}
+PERCH_ADAPTER_WEIGHT = 1.0 if PERCH_ADAPTER_WEIGHT_AUTO else float(PERCH_ADAPTER_WEIGHT_RAW)
+PERCH_ADAPTER_WEIGHT_GRID = _env_float_list(
+    "BC26_PERCH_ADAPTER_WEIGHT_GRID",
+    [0.0, 0.05, 0.08, 0.10, 0.12, 0.15, 0.18, 0.20, 0.22, 0.25, 0.30],
+)
 PERCH_ADAPTER_MODEL = None
 PERCH_EMB_CLS_CKPT_RAW = os.environ.get("BC26_PERCH_EMB_CLS_CKPT", "").strip()
 PERCH_EMB_CLS_WEIGHT = _env_float("BC26_PERCH_EMB_CLS_WEIGHT", 0.35)
@@ -274,9 +280,14 @@ print(f"  n_epochs={CFG['proto_ssm_train']['n_epochs']}  "
       f"mlp_max_iter={CFG['mlp_params']['max_iter']}")
 print(f"  seed={GLOBAL_SEED}")
 if PERCH_ADAPTER_CKPT_RAW:
+    weight_msg = (
+        "auto[" + ",".join(str(float(x)) for x in PERCH_ADAPTER_WEIGHT_GRID) + "]"
+        if PERCH_ADAPTER_WEIGHT_AUTO
+        else str(PERCH_ADAPTER_WEIGHT)
+    )
     print(
         f"  perch_adapter_ckpt={PERCH_ADAPTER_CKPT_RAW} "
-        f"(weight={PERCH_ADAPTER_WEIGHT})"
+        f"(weight={weight_msg})"
     )
 if PERCH_EMB_CLS_CKPT_RAW:
     print(
@@ -1364,6 +1375,13 @@ def _load_perch_adapter_from_env():
 def _apply_perch_adapter(scores_raw, emb_raw, adapter_model, weight=1.0, batch_size=2048):
     if adapter_model is None or abs(weight) < 1e-12:
         return scores_raw
+    delta = _predict_perch_adapter_delta(scores_raw, emb_raw, adapter_model, batch_size=batch_size)
+    return scores_raw + float(weight) * delta
+
+
+def _predict_perch_adapter_delta(scores_raw, emb_raw, adapter_model, batch_size=2048):
+    if adapter_model is None:
+        return np.zeros_like(scores_raw, dtype=np.float32)
     feat = np.concatenate([emb_raw, scores_raw], axis=1).astype(np.float32, copy=False)
     out = np.empty_like(scores_raw, dtype=np.float32)
     n = len(feat)
@@ -1375,8 +1393,28 @@ def _apply_perch_adapter(scores_raw, emb_raw, adapter_model, weight=1.0, batch_s
         class_weights = getattr(adapter_model, "adapter_class_weights_np", None)
         if class_weights is not None:
             delta = delta * class_weights[None, :]
-        out[i:j] = scores_raw[i:j] + float(weight) * delta
+        out[i:j] = delta
     return out
+
+
+def _auto_tune_perch_adapter_weight(scores_raw, emb_raw, y_true, adapter_model):
+    if adapter_model is None:
+        return float(PERCH_ADAPTER_WEIGHT)
+    delta = _predict_perch_adapter_delta(scores_raw, emb_raw, adapter_model)
+    best_w = float(PERCH_ADAPTER_WEIGHT_GRID[0])
+    best_auc = -1.0
+    rows = []
+    for w in PERCH_ADAPTER_WEIGHT_GRID:
+        logits = scores_raw + float(w) * delta
+        probs = 1.0 / (1.0 + np.exp(-np.clip(logits, -30, 30)))
+        auc = macro_auc(y_true, probs)
+        rows.append(f"{float(w):.3g}:{auc:.6f}")
+        if auc > best_auc + 1e-12:
+            best_auc = float(auc)
+            best_w = float(w)
+    print("[INFO] Adapter weight soundscape search: " + " ".join(rows))
+    print(f"[INFO] Adapter weight selected on train_soundscapes: {best_w:.4g} (auc={best_auc:.6f})")
+    return best_w
 
 
 def _load_perch_embedding_classifier_from_env():
@@ -1509,6 +1547,18 @@ def _apply_unmapped_head(scores_raw, emb_raw, unmapped_model, weight=0.35, batch
 PERCH_ADAPTER_MODEL = _load_perch_adapter_from_env()
 if PERCH_ADAPTER_MODEL is not None and "sc_tr" in globals() and "emb_tr" in globals():
     t0 = time.time()
+    if PERCH_ADAPTER_WEIGHT_AUTO and MODE == "train":
+        PERCH_ADAPTER_WEIGHT = _auto_tune_perch_adapter_weight(
+            sc_tr,
+            emb_tr,
+            Y_FULL_aligned,
+            PERCH_ADAPTER_MODEL,
+        )
+    elif PERCH_ADAPTER_WEIGHT_AUTO:
+        print(
+            "[WARN] BC26_PERCH_ADAPTER_WEIGHT=auto requires train labels; "
+            f"using default weight={PERCH_ADAPTER_WEIGHT} in {MODE} mode."
+        )
     sc_tr = _apply_perch_adapter(
         sc_tr,
         emb_tr,
