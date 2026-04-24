@@ -73,6 +73,19 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--max-files", type=int, default=0, help="0 means all files.")
     p.add_argument("--batch-size", type=int, default=256, help="Perch forward batch size.")
     p.add_argument("--train-batch-size", type=int, default=1024, help="Adapter train batch size.")
+    p.add_argument(
+        "--train-objective",
+        type=str,
+        default="window_bce",
+        choices=["window_bce", "mil_noisy_or"],
+        help="Training objective for residual_adapter: window-level BCE or file-level MIL noisy-or BCE.",
+    )
+    p.add_argument(
+        "--mil-file-batch-size",
+        type=int,
+        default=64,
+        help="Number of files per optimization step when --train-objective=mil_noisy_or.",
+    )
     p.add_argument("--epochs", type=int, default=8)
     p.add_argument("--patience", type=int, default=3)
     p.add_argument("--lr", type=float, default=3e-4)
@@ -648,38 +661,118 @@ def train_adapter(
         for i in range(0, len(idx), batch_size):
             yield idx[i : i + batch_size]
 
+    def _build_file_rows(index: np.ndarray) -> tuple[np.ndarray, dict[int, np.ndarray], np.ndarray, dict[int, int]]:
+        file_rows: dict[int, list[int]] = {}
+        for ridx in index.tolist():
+            fid = int(groups[ridx])
+            file_rows.setdefault(fid, []).append(int(ridx))
+        file_ids = np.asarray(sorted(file_rows.keys()), dtype=np.int32)
+        file_rows_np = {fid: np.asarray(rows, dtype=np.int32) for fid, rows in file_rows.items()}
+        file_targets = np.zeros((len(file_ids), n_classes), dtype=np.float32)
+        file_pos_map: dict[int, int] = {}
+        for i, fid in enumerate(file_ids.tolist()):
+            file_targets[i] = np.max(Y[file_rows_np[int(fid)]], axis=0)
+            file_pos_map[int(fid)] = int(i)
+        return file_ids, file_rows_np, file_targets, file_pos_map
+
+    def _iter_file_batches(file_ids: np.ndarray, batch_size: int, shuffle: bool) -> Iterable[np.ndarray]:
+        ids = file_ids.copy()
+        if shuffle:
+            rng.shuffle(ids)
+        for i in range(0, len(ids), batch_size):
+            yield ids[i : i + batch_size]
+
+    def _noisy_or_logits(win_logits: torch.Tensor, lengths: list[int]) -> torch.Tensor:
+        probs = torch.sigmoid(win_logits)
+        outputs = []
+        cursor = 0
+        for n in lengths:
+            p_win = probs[cursor : cursor + n]
+            p_file = 1.0 - torch.prod(torch.clamp(1.0 - p_win, min=1e-6, max=1.0), dim=0)
+            outputs.append(torch.logit(torch.clamp(p_file, min=1e-5, max=1.0 - 1e-5)))
+            cursor += n
+        return torch.stack(outputs, dim=0)
+
+    use_mil = str(args.train_objective).lower() == "mil_noisy_or"
+    tr_file_ids, tr_file_rows, Y_tr_file, tr_file_pos = _build_file_rows(tr_idx)
+    va_file_ids, va_file_rows, Y_va_file, va_file_pos = _build_file_rows(va_idx)
+    print(
+        f"[INFO] Objective={args.train_objective} | "
+        f"train_files={len(tr_file_ids)} val_files={len(va_file_ids)}"
+    )
+    if use_mil:
+        pos_f = Y_tr_file.sum(axis=0).astype(np.float32)
+        neg_f = float(len(tr_file_ids)) - pos_f
+        pos_weight_f = np.clip(neg_f / (pos_f + 1.0), 1.0, 50.0)
+        pos_weight_t = torch.from_numpy(pos_weight_f).to(device)
+
     t0 = time.time()
     for ep in range(1, args.epochs + 1):
         model.train()
         tr_losses = []
-        for b in _iter_batches(tr_idx, args.train_batch_size, shuffle=True):
-            x = torch.from_numpy(X[b]).to(device)
-            base = torch.from_numpy(base_logits[b]).to(device)
-            y = torch.from_numpy(Y[b]).to(device)
-            delta = model(x)
-            logits = base + delta
-            loss = F.binary_cross_entropy_with_logits(logits, y, pos_weight=pos_weight_t)
-            opt.zero_grad()
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            opt.step()
-            tr_losses.append(float(loss.item()))
-
-        model.eval()
-        va_losses = []
-        va_preds = []
-        with torch.no_grad():
-            for b in _iter_batches(va_idx, args.train_batch_size, shuffle=False):
+        if use_mil:
+            for f_batch in _iter_file_batches(tr_file_ids, args.mil_file_batch_size, shuffle=True):
+                row_chunks = [tr_file_rows[int(fid)] for fid in f_batch.tolist()]
+                b = np.concatenate(row_chunks, axis=0)
+                x = torch.from_numpy(X[b]).to(device)
+                base = torch.from_numpy(base_logits[b]).to(device)
+                logits = base + model(x)
+                logits_file = _noisy_or_logits(logits, [len(rows) for rows in row_chunks])
+                y_file = np.stack([Y_tr_file[tr_file_pos[int(fid)]] for fid in f_batch.tolist()], axis=0)
+                y_file_t = torch.from_numpy(y_file.astype(np.float32)).to(device)
+                loss = F.binary_cross_entropy_with_logits(logits_file, y_file_t, pos_weight=pos_weight_t)
+                opt.zero_grad()
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                opt.step()
+                tr_losses.append(float(loss.item()))
+        else:
+            for b in _iter_batches(tr_idx, args.train_batch_size, shuffle=True):
                 x = torch.from_numpy(X[b]).to(device)
                 base = torch.from_numpy(base_logits[b]).to(device)
                 y = torch.from_numpy(Y[b]).to(device)
                 delta = model(x)
                 logits = base + delta
                 loss = F.binary_cross_entropy_with_logits(logits, y, pos_weight=pos_weight_t)
-                va_losses.append(float(loss.item()))
-                va_preds.append(torch.sigmoid(logits).cpu().numpy())
-        va_pred = np.concatenate(va_preds, axis=0) if va_preds else np.zeros((0, n_classes), dtype=np.float32)
-        va_auc = macro_auc(Y[va_idx], va_pred) if len(va_idx) > 0 else 0.0
+                opt.zero_grad()
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                opt.step()
+                tr_losses.append(float(loss.item()))
+
+        model.eval()
+        va_losses = []
+        with torch.no_grad():
+            if use_mil:
+                va_pred_file = []
+                for f_batch in _iter_file_batches(va_file_ids, args.mil_file_batch_size, shuffle=False):
+                    row_chunks = [va_file_rows[int(fid)] for fid in f_batch.tolist()]
+                    b = np.concatenate(row_chunks, axis=0)
+                    x = torch.from_numpy(X[b]).to(device)
+                    base = torch.from_numpy(base_logits[b]).to(device)
+                    logits = base + model(x)
+                    logits_file = _noisy_or_logits(logits, [len(rows) for rows in row_chunks])
+                    y_file = np.stack([Y_va_file[va_file_pos[int(fid)]] for fid in f_batch.tolist()], axis=0)
+                    y_file_t = torch.from_numpy(y_file.astype(np.float32)).to(device)
+                    loss = F.binary_cross_entropy_with_logits(logits_file, y_file_t, pos_weight=pos_weight_t)
+                    va_losses.append(float(loss.item()))
+                    va_pred_file.append(torch.sigmoid(logits_file).cpu().numpy())
+                va_pred = np.concatenate(va_pred_file, axis=0) if va_pred_file else np.zeros((0, n_classes), dtype=np.float32)
+                va_auc = macro_auc(Y_va_file, va_pred) if len(va_file_ids) > 0 else 0.0
+            else:
+                va_preds = []
+                for b in _iter_batches(va_idx, args.train_batch_size, shuffle=False):
+                    x = torch.from_numpy(X[b]).to(device)
+                    base = torch.from_numpy(base_logits[b]).to(device)
+                    y = torch.from_numpy(Y[b]).to(device)
+                    delta = model(x)
+                    logits = base + delta
+                    loss = F.binary_cross_entropy_with_logits(logits, y, pos_weight=pos_weight_t)
+                    va_losses.append(float(loss.item()))
+                    va_preds.append(torch.sigmoid(logits).cpu().numpy())
+                va_pred = np.concatenate(va_preds, axis=0) if va_preds else np.zeros((0, n_classes), dtype=np.float32)
+                va_auc = macro_auc(Y[va_idx], va_pred) if len(va_idx) > 0 else 0.0
+
         print(
             f"Epoch {ep:02d}/{args.epochs} | "
             f"train_loss={np.mean(tr_losses):.5f} | val_loss={np.mean(va_losses):.5f} | val_auc={va_auc:.6f}"
@@ -698,7 +791,9 @@ def train_adapter(
     if best_state is not None:
         model.load_state_dict(best_state, strict=True)
     adapter_class_weights = np.ones(n_classes, dtype=np.float32)
-    if not args.disable_class_weights and len(va_idx) > 0:
+    if use_mil:
+        print("[INFO] Skip adapter per-class delta weights for mil_noisy_or objective.")
+    if (not use_mil) and (not args.disable_class_weights) and len(va_idx) > 0:
         grid = parse_weight_grid(args.class_weight_grid)
         model.eval()
         va_delta = []
@@ -733,6 +828,7 @@ def train_adapter(
             f"mean={float(tuned.mean()):.3f} min={float(tuned.min()):.3f} max={float(tuned.max()):.3f} "
             f"grid={','.join(str(float(x)) for x in grid)}"
         )
+    adapter_meta["train_objective"] = str(args.train_objective)
     print(f"[INFO] Adapter training done in {(time.time()-t0)/60:.1f} min | best_val_auc={best_auc:.6f}")
     return model, best_auc, adapter_meta
 
@@ -1178,6 +1274,7 @@ def main() -> None:
             "emb_dim": emb_dim,
             "output_dim": int(n_classes),
             "dropout": float(head_meta.get("dropout", args.dropout)),
+            "train_objective": str(head_meta.get("train_objective", args.train_objective)),
             "adapter_class_weights": (
                 head_meta.get("adapter_class_weights", np.ones(n_classes, dtype=np.float32)).astype(np.float32)
                 if args.head_type == "residual_adapter"
