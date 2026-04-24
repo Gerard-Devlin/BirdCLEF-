@@ -29,6 +29,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--perch-emb-cls-weight", type=float, default=0.35, help="Embedding classifier logit blend weight.")
     parser.add_argument("--unmapped-head", default="", help="Optional embedding head ckpt for unmapped classes (.pth).")
     parser.add_argument("--unmapped-head-weight", type=float, default=0.35, help="Unmapped head logit blend weight.")
+    parser.add_argument("--disable-genus-proxy", action="store_true", help="Disable genus proxy logits for unmapped classes.")
     parser.add_argument("--input-root", default="/kaggle/input", help="Root path for wheel auto-discovery.")
     parser.add_argument(
         "--pipeline-script",
@@ -66,6 +67,8 @@ def main() -> None:
     if args.unmapped_head:
         env["BC26_UNMAPPED_HEAD_CKPT"] = str(Path(args.unmapped_head))
         env["BC26_UNMAPPED_HEAD_WEIGHT"] = str(float(args.unmapped_head_weight))
+    if args.disable_genus_proxy:
+        env["BC26_DISABLE_GENUS_PROXY"] = "1"
 
     cmd = [sys.executable, str(pipeline_script)]
     print("Running:", " ".join(cmd))

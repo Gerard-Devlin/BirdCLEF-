@@ -252,6 +252,7 @@ TUNE = {
 
 DISABLE_EARLY_STOP = _env_bool("BC26_DISABLE_EARLY_STOP", False)
 GLOBAL_SEED = _env_int("BC26_SEED", 42)
+DISABLE_GENUS_PROXY = _env_bool("BC26_DISABLE_GENUS_PROXY", False)
 PERCH_ADAPTER_CKPT_RAW = os.environ.get("BC26_PERCH_ADAPTER_CKPT", "").strip()
 PERCH_ADAPTER_WEIGHT = _env_float("BC26_PERCH_ADAPTER_WEIGHT", 1.0)
 PERCH_ADAPTER_MODEL = None
@@ -304,6 +305,8 @@ print(
 )
 if DISABLE_EARLY_STOP:
     print("TUNE: early stopping disabled via BC26_DISABLE_EARLY_STOP=1")
+if DISABLE_GENUS_PROXY:
+    print("TUNE: genus proxy disabled via BC26_DISABLE_GENUS_PROXY=1")
 
 # ===== Cell 4 =====
 # Load competition CSVs and derive per-window label arrays.
@@ -458,6 +461,8 @@ proxy_map  = {
     for idx, bc_idxs in proxy_map.items()
     if CLASS_NAME_MAP.get(PRIMARY_LABELS[idx]) in PROXY_TAXA
 }
+if DISABLE_GENUS_PROXY:
+    proxy_map = {}
 
 print(f"Unmapped species total:        {len(UNMAPPED_POS)}")
 print(f"Species with genus proxy:      {len(proxy_map)}")
