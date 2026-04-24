@@ -95,8 +95,8 @@ def parse_args() -> argparse.Namespace:
         "--head-type",
         type=str,
         default="residual_adapter",
-        choices=["residual_adapter", "embedding_classifier", "unmapped_head"],
-        help="Train residual adapter, full embedding classifier, or embedding head for unmapped classes only.",
+        choices=["residual_adapter", "embedding_classifier", "mil_classifier", "unmapped_head"],
+        help="Train residual adapter, embedding classifier, MIL classifier, or embedding head for unmapped classes only.",
     )
     p.add_argument(
         "--classifier-arch",
@@ -419,6 +419,36 @@ class PerchEmbeddingClassifier(nn.Module):
         return self.net(emb)
 
 
+class PerchFeatureClassifier(nn.Module):
+    """Classifier using concatenated Perch embedding and Perch logits."""
+
+    def __init__(
+        self,
+        input_dim: int,
+        output_dim: int,
+        hidden_dim: int,
+        dropout: float,
+        arch: str = "mlp2",
+    ):
+        super().__init__()
+        self.arch = str(arch).lower()
+        if self.arch == "linear":
+            self.net = nn.Linear(input_dim, output_dim)
+        elif self.arch == "mlp2":
+            self.net = nn.Sequential(
+                nn.LayerNorm(input_dim),
+                nn.Linear(input_dim, hidden_dim),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(hidden_dim, output_dim),
+            )
+        else:
+            raise ValueError(f"Unknown feature classifier arch: {arch}")
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
+
+
 def build_adapter_model(input_dim: int, output_dim: int, args: argparse.Namespace) -> tuple[nn.Module, dict]:
     arch = str(args.adapter_arch).strip().lower()
     if arch == "linear":
@@ -517,6 +547,27 @@ def build_embedding_classifier(input_dim: int, output_dim: int, args: argparse.N
         "gate_bias": 0.0,
         "dropout": float(args.dropout) if arch == "mlp2" else 0.0,
         "emb_dim": int(emb_dim),
+    }
+    return model, meta
+
+
+def build_mil_classifier(input_dim: int, output_dim: int, args: argparse.Namespace) -> tuple[nn.Module, dict]:
+    arch = str(args.classifier_arch).strip().lower()
+    model = PerchFeatureClassifier(
+        input_dim=int(input_dim),
+        output_dim=int(output_dim),
+        hidden_dim=int(args.hidden_dim),
+        dropout=float(args.dropout),
+        arch=arch,
+    )
+    meta = {
+        "head_type": "mil_classifier",
+        "classifier_arch": arch,
+        "hidden_dim": int(args.hidden_dim) if arch == "mlp2" else 0,
+        "hidden_dim2": 0,
+        "gate_bias": 0.0,
+        "dropout": float(args.dropout) if arch == "mlp2" else 0.0,
+        "emb_dim": int(input_dim - output_dim),
     }
     return model, meta
 
@@ -831,6 +882,144 @@ def train_adapter(
     adapter_meta["train_objective"] = str(args.train_objective)
     print(f"[INFO] Adapter training done in {(time.time()-t0)/60:.1f} min | best_val_auc={best_auc:.6f}")
     return model, best_auc, adapter_meta
+
+
+def train_mil_classifier(
+    X: np.ndarray,
+    Y: np.ndarray,
+    groups: np.ndarray,
+    args: argparse.Namespace,
+    n_classes: int,
+) -> tuple[nn.Module, float, dict]:
+    device = torch.device("cuda" if args.use_gpu and torch.cuda.is_available() else "cpu")
+    if args.use_gpu and device.type != "cuda":
+        raise RuntimeError("--use-gpu is set, but torch.cuda.is_available() is False.")
+    print(f"[INFO] MIL classifier train device: {device}")
+
+    unique_files = np.unique(groups)
+    rng = np.random.default_rng(args.seed)
+    rng.shuffle(unique_files)
+    n_val_files = max(1, int(len(unique_files) * args.val_ratio))
+    val_file_set = set(unique_files[:n_val_files].tolist())
+    val_mask = np.array([g in val_file_set for g in groups], dtype=bool)
+    tr_idx = np.where(~val_mask)[0]
+    va_idx = np.where(val_mask)[0]
+
+    def _build_file_rows(index: np.ndarray) -> tuple[np.ndarray, dict[int, np.ndarray], np.ndarray, dict[int, int]]:
+        file_rows: dict[int, list[int]] = {}
+        for ridx in index.tolist():
+            fid = int(groups[ridx])
+            file_rows.setdefault(fid, []).append(int(ridx))
+        file_ids = np.asarray(sorted(file_rows.keys()), dtype=np.int32)
+        file_rows_np = {fid: np.asarray(rows, dtype=np.int32) for fid, rows in file_rows.items()}
+        file_targets = np.zeros((len(file_ids), n_classes), dtype=np.float32)
+        file_pos_map: dict[int, int] = {}
+        for i, fid in enumerate(file_ids.tolist()):
+            file_targets[i] = np.max(Y[file_rows_np[int(fid)]], axis=0)
+            file_pos_map[int(fid)] = int(i)
+        return file_ids, file_rows_np, file_targets, file_pos_map
+
+    tr_file_ids, tr_file_rows, Y_tr_file, tr_file_pos = _build_file_rows(tr_idx)
+    va_file_ids, va_file_rows, Y_va_file, va_file_pos = _build_file_rows(va_idx)
+    print(
+        f"[INFO] Split: train_windows={len(tr_idx)}, val_windows={len(va_idx)}, "
+        f"train_files={len(tr_file_ids)}, val_files={len(va_file_ids)}"
+    )
+
+    pos = Y_tr_file.sum(axis=0).astype(np.float32)
+    neg = float(len(tr_file_ids)) - pos
+    pos_weight = np.clip(neg / (pos + 1.0), 1.0, 50.0)
+    pos_weight_t = torch.from_numpy(pos_weight).to(device)
+
+    model, clf_meta = build_mil_classifier(
+        input_dim=int(X.shape[1]),
+        output_dim=n_classes,
+        args=args,
+    )
+    model = model.to(device)
+    print(
+        "[INFO] MIL classifier arch="
+        f"{clf_meta['classifier_arch']} "
+        f"(input_dim={X.shape[1]}, hidden={clf_meta['hidden_dim']}, dropout={clf_meta['dropout']})"
+    )
+    opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+
+    def _iter_file_batches(file_ids: np.ndarray, batch_size: int, shuffle: bool) -> Iterable[np.ndarray]:
+        ids = file_ids.copy()
+        if shuffle:
+            rng.shuffle(ids)
+        for i in range(0, len(ids), batch_size):
+            yield ids[i : i + batch_size]
+
+    def _noisy_or_logits(win_logits: torch.Tensor, lengths: list[int]) -> torch.Tensor:
+        probs = torch.sigmoid(win_logits)
+        outputs = []
+        cursor = 0
+        for n in lengths:
+            p_win = probs[cursor : cursor + n]
+            p_file = 1.0 - torch.prod(torch.clamp(1.0 - p_win, min=1e-6, max=1.0), dim=0)
+            outputs.append(torch.logit(torch.clamp(p_file, min=1e-5, max=1.0 - 1e-5)))
+            cursor += n
+        return torch.stack(outputs, dim=0)
+
+    best_auc = -1.0
+    best_state = None
+    wait = 0
+    t0 = time.time()
+    for ep in range(1, args.epochs + 1):
+        model.train()
+        tr_losses = []
+        for f_batch in _iter_file_batches(tr_file_ids, args.mil_file_batch_size, shuffle=True):
+            row_chunks = [tr_file_rows[int(fid)] for fid in f_batch.tolist()]
+            b = np.concatenate(row_chunks, axis=0)
+            x = torch.from_numpy(X[b]).to(device)
+            logits_file = _noisy_or_logits(model(x), [len(rows) for rows in row_chunks])
+            y_file = np.stack([Y_tr_file[tr_file_pos[int(fid)]] for fid in f_batch.tolist()], axis=0)
+            y_file_t = torch.from_numpy(y_file.astype(np.float32)).to(device)
+            loss = F.binary_cross_entropy_with_logits(logits_file, y_file_t, pos_weight=pos_weight_t)
+            opt.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            opt.step()
+            tr_losses.append(float(loss.item()))
+
+        model.eval()
+        va_losses = []
+        va_preds = []
+        with torch.no_grad():
+            for f_batch in _iter_file_batches(va_file_ids, args.mil_file_batch_size, shuffle=False):
+                row_chunks = [va_file_rows[int(fid)] for fid in f_batch.tolist()]
+                b = np.concatenate(row_chunks, axis=0)
+                x = torch.from_numpy(X[b]).to(device)
+                logits_file = _noisy_or_logits(model(x), [len(rows) for rows in row_chunks])
+                y_file = np.stack([Y_va_file[va_file_pos[int(fid)]] for fid in f_batch.tolist()], axis=0)
+                y_file_t = torch.from_numpy(y_file.astype(np.float32)).to(device)
+                loss = F.binary_cross_entropy_with_logits(logits_file, y_file_t, pos_weight=pos_weight_t)
+                va_losses.append(float(loss.item()))
+                va_preds.append(torch.sigmoid(logits_file).cpu().numpy())
+
+        va_pred = np.concatenate(va_preds, axis=0) if va_preds else np.zeros((0, n_classes), dtype=np.float32)
+        va_auc = macro_auc(Y_va_file, va_pred) if len(va_file_ids) > 0 else 0.0
+        print(
+            f"Epoch {ep:02d}/{args.epochs} | "
+            f"train_loss={np.mean(tr_losses):.5f} | val_loss={np.mean(va_losses):.5f} | val_auc={va_auc:.6f}"
+        )
+
+        if va_auc > best_auc:
+            best_auc = va_auc
+            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+            wait = 0
+        else:
+            wait += 1
+            if wait >= args.patience:
+                print(f"[INFO] Early stop at epoch {ep}.")
+                break
+
+    if best_state is not None:
+        model.load_state_dict(best_state, strict=True)
+    clf_meta["train_objective"] = "mil_noisy_or"
+    print(f"[INFO] MIL classifier training done in {(time.time()-t0)/60:.1f} min | best_val_auc={best_auc:.6f}")
+    return model, best_auc, clf_meta
 
 
 def train_embedding_classifier(
@@ -1245,6 +1434,9 @@ def main() -> None:
     if args.head_type == "embedding_classifier":
         model, best_auc, head_meta = train_embedding_classifier(X, Y, G, args, n_classes=n_classes)
         state_key = "classifier_state_dict"
+    elif args.head_type == "mil_classifier":
+        model, best_auc, head_meta = train_mil_classifier(X, Y, G, args, n_classes=n_classes)
+        state_key = "mil_classifier_state_dict"
     elif args.head_type == "unmapped_head":
         model, best_auc, head_meta = train_unmapped_head(
             X,

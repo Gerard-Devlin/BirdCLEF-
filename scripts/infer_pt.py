@@ -27,6 +27,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--perch-adapter-weight", type=float, default=1.0, help="Adapter delta weight.")
     parser.add_argument("--perch-emb-cls", default="", help="Optional pure Perch embedding classifier ckpt (.pth).")
     parser.add_argument("--perch-emb-cls-weight", type=float, default=0.35, help="Embedding classifier logit blend weight.")
+    parser.add_argument("--perch-mil-cls", default="", help="Optional Perch feature MIL classifier ckpt (.pth).")
+    parser.add_argument("--perch-mil-cls-weight", type=float, default=0.35, help="MIL classifier logit blend weight.")
     parser.add_argument("--unmapped-head", default="", help="Optional embedding head ckpt for unmapped classes (.pth).")
     parser.add_argument("--unmapped-head-weight", type=float, default=0.35, help="Unmapped head logit blend weight.")
     parser.add_argument("--disable-genus-proxy", action="store_true", help="Disable genus proxy logits for unmapped classes.")
@@ -64,6 +66,9 @@ def main() -> None:
     if args.perch_emb_cls:
         env["BC26_PERCH_EMB_CLS_CKPT"] = str(Path(args.perch_emb_cls))
         env["BC26_PERCH_EMB_CLS_WEIGHT"] = str(float(args.perch_emb_cls_weight))
+    if args.perch_mil_cls:
+        env["BC26_PERCH_MIL_CLS_CKPT"] = str(Path(args.perch_mil_cls))
+        env["BC26_PERCH_MIL_CLS_WEIGHT"] = str(float(args.perch_mil_cls_weight))
     if args.unmapped_head:
         env["BC26_UNMAPPED_HEAD_CKPT"] = str(Path(args.unmapped_head))
         env["BC26_UNMAPPED_HEAD_WEIGHT"] = str(float(args.unmapped_head_weight))

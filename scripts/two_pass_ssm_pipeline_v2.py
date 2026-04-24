@@ -265,6 +265,15 @@ PERCH_ADAPTER_MODEL = None
 PERCH_EMB_CLS_CKPT_RAW = os.environ.get("BC26_PERCH_EMB_CLS_CKPT", "").strip()
 PERCH_EMB_CLS_WEIGHT = _env_float("BC26_PERCH_EMB_CLS_WEIGHT", 0.35)
 PERCH_EMB_CLS_MODEL = None
+PERCH_MIL_CLS_CKPT_RAW = os.environ.get("BC26_PERCH_MIL_CLS_CKPT", "").strip()
+PERCH_MIL_CLS_WEIGHT_RAW = os.environ.get("BC26_PERCH_MIL_CLS_WEIGHT", "0.35").strip()
+PERCH_MIL_CLS_WEIGHT_AUTO = PERCH_MIL_CLS_WEIGHT_RAW.lower() in {"auto", "cv", "soundscape"}
+PERCH_MIL_CLS_WEIGHT = 0.35 if PERCH_MIL_CLS_WEIGHT_AUTO else float(PERCH_MIL_CLS_WEIGHT_RAW)
+PERCH_MIL_CLS_WEIGHT_GRID = _env_float_list(
+    "BC26_PERCH_MIL_CLS_WEIGHT_GRID",
+    [0.0, 0.05, 0.10, 0.15, 0.20, 0.30, 0.40, 0.50, 0.65, 0.80, 1.0],
+)
+PERCH_MIL_CLS_MODEL = None
 UNMAPPED_HEAD_CKPT_RAW = os.environ.get("BC26_UNMAPPED_HEAD_CKPT", "").strip()
 UNMAPPED_HEAD_WEIGHT = _env_float("BC26_UNMAPPED_HEAD_WEIGHT", 0.35)
 UNMAPPED_HEAD_MODEL = None
@@ -293,6 +302,16 @@ if PERCH_EMB_CLS_CKPT_RAW:
     print(
         f"  perch_emb_cls_ckpt={PERCH_EMB_CLS_CKPT_RAW} "
         f"(blend_weight={PERCH_EMB_CLS_WEIGHT})"
+    )
+if PERCH_MIL_CLS_CKPT_RAW:
+    mil_weight_msg = (
+        "auto[" + ",".join(str(float(x)) for x in PERCH_MIL_CLS_WEIGHT_GRID) + "]"
+        if PERCH_MIL_CLS_WEIGHT_AUTO
+        else str(PERCH_MIL_CLS_WEIGHT)
+    )
+    print(
+        f"  perch_mil_cls_ckpt={PERCH_MIL_CLS_CKPT_RAW} "
+        f"(blend_weight={mil_weight_msg})"
     )
 if UNMAPPED_HEAD_CKPT_RAW:
     print(
@@ -1250,6 +1269,29 @@ class PerchEmbeddingClassifier(nn.Module):
         return self.net(emb)
 
 
+class PerchFeatureClassifier(nn.Module):
+    """Classifier using concatenated Perch embedding and Perch logits."""
+
+    def __init__(self, input_dim=1770, output_dim=234, hidden_dim=512, dropout=0.2, arch="mlp2"):
+        super().__init__()
+        self.arch = str(arch).lower()
+        if self.arch == "linear":
+            self.net = nn.Linear(input_dim, output_dim)
+        elif self.arch == "mlp2":
+            self.net = nn.Sequential(
+                nn.LayerNorm(input_dim),
+                nn.Linear(input_dim, hidden_dim),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(hidden_dim, output_dim),
+            )
+        else:
+            raise ValueError(f"Unknown feature classifier arch: {arch}")
+
+    def forward(self, x):
+        return self.net(x)
+
+
 def _sanitize_state_dict_local(state_dict):
     cleaned = {}
     for k, v in state_dict.items():
@@ -1475,6 +1517,92 @@ def _apply_perch_embedding_classifier(scores_raw, emb_raw, classifier_model, wei
     return out
 
 
+def _load_perch_mil_classifier_from_env():
+    if not PERCH_MIL_CLS_CKPT_RAW:
+        return None
+    ckpt_path = Path(PERCH_MIL_CLS_CKPT_RAW)
+    if not ckpt_path.exists():
+        print(f"[WARN] Perch MIL classifier ckpt not found: {ckpt_path}. Skip classifier.")
+        return None
+
+    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    ckpt_labels = ckpt.get("primary_labels")
+    if ckpt_labels is not None and list(ckpt_labels) != list(PRIMARY_LABELS):
+        raise RuntimeError(
+            "Perch MIL classifier label space mismatch with current sample_submission."
+        )
+
+    state_dict = ckpt.get("mil_classifier_state_dict")
+    if state_dict is None:
+        raise RuntimeError(
+            f"Checkpoint {ckpt_path} does not contain mil_classifier_state_dict. "
+            "Train with --head-type mil_classifier."
+        )
+
+    input_dim = int(ckpt.get("input_dim", 1536 + N_CLASSES))
+    output_dim = int(ckpt.get("output_dim", N_CLASSES))
+    hidden_dim = int(ckpt.get("hidden_dim", 512))
+    dropout = float(ckpt.get("dropout", 0.2))
+    arch = str(ckpt.get("classifier_arch", "mlp2")).strip().lower() or "mlp2"
+
+    model = PerchFeatureClassifier(
+        input_dim=input_dim,
+        output_dim=output_dim,
+        hidden_dim=hidden_dim,
+        dropout=dropout,
+        arch=arch,
+    ).to(TORCH_DEVICE)
+    model.load_state_dict(_sanitize_state_dict_local(state_dict), strict=True)
+    model.eval()
+    print(
+        f"[OK] Loaded Perch MIL classifier: {ckpt_path} "
+        f"(arch={arch}, input_dim={input_dim}, hidden={hidden_dim}, blend_weight={PERCH_MIL_CLS_WEIGHT})"
+    )
+    return model
+
+
+def _apply_perch_mil_classifier(scores_raw, emb_raw, classifier_model, weight=0.35, batch_size=2048):
+    if classifier_model is None or abs(weight) < 1e-12:
+        return scores_raw
+    cls_logits = _predict_perch_mil_classifier_logits(scores_raw, emb_raw, classifier_model, batch_size=batch_size)
+    return ((1.0 - float(weight)) * scores_raw + float(weight) * cls_logits).astype(np.float32, copy=False)
+
+
+def _predict_perch_mil_classifier_logits(scores_raw, emb_raw, classifier_model, batch_size=2048):
+    if classifier_model is None:
+        return np.zeros_like(scores_raw, dtype=np.float32)
+    feat = np.concatenate([emb_raw, scores_raw], axis=1).astype(np.float32, copy=False)
+    out = np.empty_like(scores_raw, dtype=np.float32)
+    n = len(feat)
+    for i in range(0, n, batch_size):
+        j = min(n, i + batch_size)
+        x = torch.from_numpy(feat[i:j]).to(TORCH_DEVICE)
+        with torch.no_grad():
+            cls_logits = classifier_model(x).detach().cpu().numpy().astype(np.float32)
+        out[i:j] = cls_logits
+    return out
+
+
+def _auto_tune_perch_mil_classifier_weight(scores_raw, emb_raw, y_true, classifier_model):
+    if classifier_model is None:
+        return float(PERCH_MIL_CLS_WEIGHT)
+    cls_logits = _predict_perch_mil_classifier_logits(scores_raw, emb_raw, classifier_model)
+    best_w = float(PERCH_MIL_CLS_WEIGHT_GRID[0])
+    best_auc = -1.0
+    rows = []
+    for w in PERCH_MIL_CLS_WEIGHT_GRID:
+        logits = (1.0 - float(w)) * scores_raw + float(w) * cls_logits
+        probs = 1.0 / (1.0 + np.exp(-np.clip(logits, -30, 30)))
+        auc = macro_auc(y_true, probs)
+        rows.append(f"{float(w):.3g}:{auc:.6f}")
+        if auc > best_auc + 1e-12:
+            best_auc = float(auc)
+            best_w = float(w)
+    print("[INFO] MIL classifier weight soundscape search: " + " ".join(rows))
+    print(f"[INFO] MIL classifier weight selected on train_soundscapes: {best_w:.4g} (auc={best_auc:.6f})")
+    return best_w
+
+
 def _load_unmapped_head_from_env():
     if not UNMAPPED_HEAD_CKPT_RAW:
         return None
@@ -1581,6 +1709,32 @@ if PERCH_EMB_CLS_MODEL is not None and "sc_tr" in globals() and "emb_tr" in glob
     )
     print(
         f"[OK] Applied Perch embedding classifier to training cache in {time.time()-t0:.1f}s "
+        f"| score range [{sc_tr.min():.3f}, {sc_tr.max():.3f}]"
+    )
+
+PERCH_MIL_CLS_MODEL = _load_perch_mil_classifier_from_env()
+if PERCH_MIL_CLS_MODEL is not None and "sc_tr" in globals() and "emb_tr" in globals():
+    t0 = time.time()
+    if PERCH_MIL_CLS_WEIGHT_AUTO and MODE == "train":
+        PERCH_MIL_CLS_WEIGHT = _auto_tune_perch_mil_classifier_weight(
+            sc_tr,
+            emb_tr,
+            Y_FULL_aligned,
+            PERCH_MIL_CLS_MODEL,
+        )
+    elif PERCH_MIL_CLS_WEIGHT_AUTO:
+        print(
+            "[WARN] BC26_PERCH_MIL_CLS_WEIGHT=auto requires train labels; "
+            f"using default weight={PERCH_MIL_CLS_WEIGHT} in {MODE} mode."
+        )
+    sc_tr = _apply_perch_mil_classifier(
+        sc_tr,
+        emb_tr,
+        PERCH_MIL_CLS_MODEL,
+        weight=PERCH_MIL_CLS_WEIGHT,
+    )
+    print(
+        f"[OK] Applied Perch MIL classifier to training cache in {time.time()-t0:.1f}s "
         f"| score range [{sc_tr.min():.3f}, {sc_tr.max():.3f}]"
     )
 
@@ -2648,6 +2802,18 @@ if PERCH_EMB_CLS_MODEL is not None:
         f"[OK] Applied Perch embedding classifier to test scores in {time.time()-t0:.1f}s "
         f"| score range [{sc_te.min():.3f}, {sc_te.max():.3f}]"
     )
+if PERCH_MIL_CLS_MODEL is not None:
+    t0 = time.time()
+    sc_te = _apply_perch_mil_classifier(
+        sc_te,
+        emb_te,
+        PERCH_MIL_CLS_MODEL,
+        weight=PERCH_MIL_CLS_WEIGHT,
+    )
+    print(
+        f"[OK] Applied Perch MIL classifier to test scores in {time.time()-t0:.1f}s "
+        f"| score range [{sc_te.min():.3f}, {sc_te.max():.3f}]"
+    )
 if UNMAPPED_HEAD_MODEL is not None:
     t0 = time.time()
     sc_te = _apply_unmapped_head(
@@ -2892,6 +3058,8 @@ else:
                 "tune": dict(TUNE),
                 "perch_adapter_ckpt": PERCH_ADAPTER_CKPT_RAW,
                 "perch_adapter_weight": float(PERCH_ADAPTER_WEIGHT),
+                "perch_mil_cls_ckpt": PERCH_MIL_CLS_CKPT_RAW,
+                "perch_mil_cls_weight": float(PERCH_MIL_CLS_WEIGHT),
             },
             CKPT_PATH,
         )
