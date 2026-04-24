@@ -82,8 +82,8 @@ def parse_args() -> argparse.Namespace:
         "--head-type",
         type=str,
         default="residual_adapter",
-        choices=["residual_adapter", "embedding_classifier"],
-        help="Train residual Perch-logit adapter or pure embedding classifier.",
+        choices=["residual_adapter", "embedding_classifier", "unmapped_head"],
+        help="Train residual adapter, full embedding classifier, or embedding head for unmapped classes only.",
     )
     p.add_argument(
         "--classifier-arch",
@@ -844,6 +844,128 @@ def train_embedding_classifier(
     return model, best_auc, clf_meta
 
 
+def train_unmapped_head(
+    X: np.ndarray,
+    Y: np.ndarray,
+    groups: np.ndarray,
+    class_indices: np.ndarray,
+    args: argparse.Namespace,
+    n_classes: int,
+) -> tuple[nn.Module, float, dict]:
+    device = torch.device("cuda" if args.use_gpu and torch.cuda.is_available() else "cpu")
+    if args.use_gpu and device.type != "cuda":
+        raise RuntimeError("--use-gpu is set, but torch.cuda.is_available() is False.")
+    class_indices = np.asarray(class_indices, dtype=np.int32)
+    if len(class_indices) == 0:
+        raise RuntimeError("No unmapped classes available for --head-type unmapped_head.")
+    print(f"[INFO] Unmapped head train device: {device} | classes={len(class_indices)}")
+
+    emb_dim = int(X.shape[1] - n_classes)
+    if emb_dim <= 0:
+        raise RuntimeError(f"Invalid feature dim for unmapped head: X={X.shape}, n_classes={n_classes}")
+    E = X[:, :emb_dim].astype(np.float32, copy=False)
+    Y_sub = Y[:, class_indices].astype(np.float32, copy=False)
+
+    unique_files = np.unique(groups)
+    rng = np.random.default_rng(args.seed)
+    rng.shuffle(unique_files)
+    n_val_files = max(1, int(len(unique_files) * args.val_ratio))
+    val_file_set = set(unique_files[:n_val_files].tolist())
+    val_mask = np.array([g in val_file_set for g in groups], dtype=bool)
+    tr_idx = np.where(~val_mask)[0]
+    va_idx = np.where(val_mask)[0]
+    print(f"[INFO] Split: train_windows={len(tr_idx)}, val_windows={len(va_idx)}, files={len(unique_files)}")
+
+    y_tr = Y_sub[tr_idx]
+    pos = y_tr.sum(axis=0).astype(np.float32)
+    neg = float(len(tr_idx)) - pos
+    pos_weight = np.clip(neg / (pos + 1.0), 1.0, 100.0)
+    pos_weight_t = torch.from_numpy(pos_weight).to(device)
+    print(
+        f"[INFO] Unmapped positives: active={(pos > 0).sum()}/{len(pos)} "
+        f"min={float(pos.min()):.0f} max={float(pos.max()):.0f}"
+    )
+
+    arch = str(args.classifier_arch).strip().lower()
+    model = PerchEmbeddingClassifier(
+        emb_dim=emb_dim,
+        output_dim=len(class_indices),
+        hidden_dim=int(args.hidden_dim),
+        dropout=float(args.dropout),
+        arch=arch,
+    ).to(device)
+    opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+
+    best_auc = -1.0
+    best_state = None
+    wait = 0
+
+    def _iter_batches(index: np.ndarray, batch_size: int, shuffle: bool) -> Iterable[np.ndarray]:
+        idx = index.copy()
+        if shuffle:
+            rng.shuffle(idx)
+        for i in range(0, len(idx), batch_size):
+            yield idx[i : i + batch_size]
+
+    t0 = time.time()
+    for ep in range(1, args.epochs + 1):
+        model.train()
+        tr_losses = []
+        for b in _iter_batches(tr_idx, args.train_batch_size, shuffle=True):
+            emb = torch.from_numpy(E[b]).to(device)
+            y = torch.from_numpy(Y_sub[b]).to(device)
+            logits = model(emb)
+            loss = F.binary_cross_entropy_with_logits(logits, y, pos_weight=pos_weight_t)
+            opt.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            opt.step()
+            tr_losses.append(float(loss.item()))
+
+        model.eval()
+        va_losses = []
+        va_preds = []
+        with torch.no_grad():
+            for b in _iter_batches(va_idx, args.train_batch_size, shuffle=False):
+                emb = torch.from_numpy(E[b]).to(device)
+                y = torch.from_numpy(Y_sub[b]).to(device)
+                logits = model(emb)
+                loss = F.binary_cross_entropy_with_logits(logits, y, pos_weight=pos_weight_t)
+                va_losses.append(float(loss.item()))
+                va_preds.append(torch.sigmoid(logits).cpu().numpy())
+        va_pred = np.concatenate(va_preds, axis=0) if va_preds else np.zeros((0, len(class_indices)), dtype=np.float32)
+        va_auc = macro_auc(Y_sub[va_idx], va_pred) if len(va_idx) > 0 else 0.0
+        print(
+            f"Epoch {ep:02d}/{args.epochs} | "
+            f"train_loss={np.mean(tr_losses):.5f} | val_loss={np.mean(va_losses):.5f} | val_auc={va_auc:.6f}"
+        )
+
+        if va_auc > best_auc:
+            best_auc = va_auc
+            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+            wait = 0
+        else:
+            wait += 1
+            if wait >= args.patience:
+                print(f"[INFO] Early stop at epoch {ep}.")
+                break
+
+    if best_state is not None:
+        model.load_state_dict(best_state, strict=True)
+    meta = {
+        "head_type": "unmapped_head",
+        "classifier_arch": arch,
+        "hidden_dim": int(args.hidden_dim) if arch == "mlp2" else 0,
+        "hidden_dim2": 0,
+        "gate_bias": 0.0,
+        "dropout": float(args.dropout) if arch == "mlp2" else 0.0,
+        "emb_dim": int(emb_dim),
+        "unmapped_class_indices": class_indices.astype(np.int32),
+    }
+    print(f"[INFO] Unmapped head training done in {(time.time()-t0)/60:.1f} min | best_val_auc={best_auc:.6f}")
+    return model, best_auc, meta
+
+
 def main() -> None:
     args = parse_args()
     set_seed(args.seed)
@@ -862,6 +984,16 @@ def main() -> None:
     )
     n_classes = len(primary_labels)
     label_to_idx = {c: i for i, c in enumerate(primary_labels)}
+    mapped_set = set(int(x) for x in mapped_pos.tolist())
+    proxy_set = set(int(x) for x in proxy_map.keys())
+    unmapped_head_indices = np.asarray(
+        [i for i in range(n_classes) if i not in mapped_set and i not in proxy_set],
+        dtype=np.int32,
+    )
+    print(
+        f"[INFO] Unmapped head classes: {len(unmapped_head_indices)} "
+        f"(not direct Perch and not genus proxy)."
+    )
 
     train_df = pd.read_csv(args.train_csv)
     targets_label_names = make_targets(train_df, set(primary_labels), args.include_secondary)
@@ -1017,6 +1149,16 @@ def main() -> None:
     if args.head_type == "embedding_classifier":
         model, best_auc, head_meta = train_embedding_classifier(X, Y, G, args, n_classes=n_classes)
         state_key = "classifier_state_dict"
+    elif args.head_type == "unmapped_head":
+        model, best_auc, head_meta = train_unmapped_head(
+            X,
+            Y,
+            G,
+            unmapped_head_indices,
+            args,
+            n_classes=n_classes,
+        )
+        state_key = "unmapped_head_state_dict"
     else:
         model, best_auc, head_meta = train_adapter(X, B, Y, G, args, n_classes=n_classes)
         state_key = "adapter_state_dict"
@@ -1047,6 +1189,11 @@ def main() -> None:
                 else None
             ),
             "genus_proxy_classes": sorted(int(k) for k in proxy_map.keys()),
+            "unmapped_class_indices": (
+                head_meta.get("unmapped_class_indices", np.asarray([], dtype=np.int32)).astype(np.int32)
+                if args.head_type == "unmapped_head"
+                else unmapped_head_indices.astype(np.int32)
+            ),
             "primary_labels": primary_labels,
             "best_val_auc": float(best_auc),
             "segments_per_file": int(args.segments_per_file),

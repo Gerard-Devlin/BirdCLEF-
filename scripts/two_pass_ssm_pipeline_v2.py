@@ -258,6 +258,9 @@ PERCH_ADAPTER_MODEL = None
 PERCH_EMB_CLS_CKPT_RAW = os.environ.get("BC26_PERCH_EMB_CLS_CKPT", "").strip()
 PERCH_EMB_CLS_WEIGHT = _env_float("BC26_PERCH_EMB_CLS_WEIGHT", 0.35)
 PERCH_EMB_CLS_MODEL = None
+UNMAPPED_HEAD_CKPT_RAW = os.environ.get("BC26_UNMAPPED_HEAD_CKPT", "").strip()
+UNMAPPED_HEAD_WEIGHT = _env_float("BC26_UNMAPPED_HEAD_WEIGHT", 0.35)
+UNMAPPED_HEAD_MODEL = None
 
 np.random.seed(GLOBAL_SEED)
 random.seed(GLOBAL_SEED)
@@ -278,6 +281,11 @@ if PERCH_EMB_CLS_CKPT_RAW:
     print(
         f"  perch_emb_cls_ckpt={PERCH_EMB_CLS_CKPT_RAW} "
         f"(blend_weight={PERCH_EMB_CLS_WEIGHT})"
+    )
+if UNMAPPED_HEAD_CKPT_RAW:
+    print(
+        f"  unmapped_head_ckpt={UNMAPPED_HEAD_CKPT_RAW} "
+        f"(blend_weight={UNMAPPED_HEAD_WEIGHT})"
     )
  
 print("Config ready")
@@ -1424,6 +1432,75 @@ def _apply_perch_embedding_classifier(scores_raw, emb_raw, classifier_model, wei
     return out
 
 
+def _load_unmapped_head_from_env():
+    if not UNMAPPED_HEAD_CKPT_RAW:
+        return None
+    ckpt_path = Path(UNMAPPED_HEAD_CKPT_RAW)
+    if not ckpt_path.exists():
+        print(f"[WARN] Unmapped head ckpt not found: {ckpt_path}. Skip unmapped head.")
+        return None
+
+    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    ckpt_labels = ckpt.get("primary_labels")
+    if ckpt_labels is not None and list(ckpt_labels) != list(PRIMARY_LABELS):
+        raise RuntimeError("Unmapped head label space mismatch with current sample_submission.")
+
+    state_dict = ckpt.get("unmapped_head_state_dict")
+    if state_dict is None:
+        raise RuntimeError(
+            f"Checkpoint {ckpt_path} does not contain unmapped_head_state_dict. "
+            "Train with --head-type unmapped_head."
+        )
+
+    class_indices = np.asarray(ckpt.get("unmapped_class_indices", []), dtype=np.int32)
+    if len(class_indices) == 0:
+        raise RuntimeError(f"Checkpoint {ckpt_path} has no unmapped_class_indices.")
+    if class_indices.min() < 0 or class_indices.max() >= N_CLASSES:
+        raise RuntimeError(f"Checkpoint {ckpt_path} has out-of-range unmapped_class_indices.")
+
+    emb_dim = int(ckpt.get("emb_dim", 1536))
+    hidden_dim = int(ckpt.get("hidden_dim", 512))
+    dropout = float(ckpt.get("dropout", 0.2))
+    arch = str(ckpt.get("classifier_arch", "mlp2")).strip().lower() or "mlp2"
+
+    model = PerchEmbeddingClassifier(
+        emb_dim=emb_dim,
+        output_dim=len(class_indices),
+        hidden_dim=hidden_dim,
+        dropout=dropout,
+        arch=arch,
+    ).to(TORCH_DEVICE)
+    model.load_state_dict(_sanitize_state_dict_local(state_dict), strict=True)
+    model.unmapped_class_indices_np = class_indices
+    model.eval()
+    print(
+        f"[OK] Loaded Unmapped head: {ckpt_path} "
+        f"(arch={arch}, hidden={hidden_dim}, emb_dim={emb_dim}, classes={len(class_indices)}, "
+        f"blend_weight={UNMAPPED_HEAD_WEIGHT})"
+    )
+    return model
+
+
+def _apply_unmapped_head(scores_raw, emb_raw, unmapped_model, weight=0.35, batch_size=2048):
+    if unmapped_model is None or abs(weight) < 1e-12:
+        return scores_raw
+    class_indices = getattr(unmapped_model, "unmapped_class_indices_np", None)
+    if class_indices is None or len(class_indices) == 0:
+        return scores_raw
+    out = scores_raw.copy()
+    n = len(emb_raw)
+    for i in range(0, n, batch_size):
+        j = min(n, i + batch_size)
+        emb = torch.from_numpy(emb_raw[i:j].astype(np.float32, copy=False)).to(TORCH_DEVICE)
+        with torch.no_grad():
+            logits = unmapped_model(emb).detach().cpu().numpy().astype(np.float32)
+        out[i:j, class_indices] = (
+            (1.0 - float(weight)) * scores_raw[i:j, class_indices]
+            + float(weight) * logits
+        )
+    return out
+
+
 PERCH_ADAPTER_MODEL = _load_perch_adapter_from_env()
 if PERCH_ADAPTER_MODEL is not None and "sc_tr" in globals() and "emb_tr" in globals():
     t0 = time.time()
@@ -1449,6 +1526,20 @@ if PERCH_EMB_CLS_MODEL is not None and "sc_tr" in globals() and "emb_tr" in glob
     )
     print(
         f"[OK] Applied Perch embedding classifier to training cache in {time.time()-t0:.1f}s "
+        f"| score range [{sc_tr.min():.3f}, {sc_tr.max():.3f}]"
+    )
+
+UNMAPPED_HEAD_MODEL = _load_unmapped_head_from_env()
+if UNMAPPED_HEAD_MODEL is not None and "sc_tr" in globals() and "emb_tr" in globals():
+    t0 = time.time()
+    sc_tr = _apply_unmapped_head(
+        sc_tr,
+        emb_tr,
+        UNMAPPED_HEAD_MODEL,
+        weight=UNMAPPED_HEAD_WEIGHT,
+    )
+    print(
+        f"[OK] Applied Unmapped head to training cache in {time.time()-t0:.1f}s "
         f"| score range [{sc_tr.min():.3f}, {sc_tr.max():.3f}]"
     )
 
@@ -2500,6 +2591,18 @@ if PERCH_EMB_CLS_MODEL is not None:
     )
     print(
         f"[OK] Applied Perch embedding classifier to test scores in {time.time()-t0:.1f}s "
+        f"| score range [{sc_te.min():.3f}, {sc_te.max():.3f}]"
+    )
+if UNMAPPED_HEAD_MODEL is not None:
+    t0 = time.time()
+    sc_te = _apply_unmapped_head(
+        sc_te,
+        emb_te,
+        UNMAPPED_HEAD_MODEL,
+        weight=UNMAPPED_HEAD_WEIGHT,
+    )
+    print(
+        f"[OK] Applied Unmapped head to test scores in {time.time()-t0:.1f}s "
         f"| score range [{sc_te.min():.3f}, {sc_te.max():.3f}]"
     )
 
