@@ -1289,6 +1289,7 @@ def _load_perch_adapter_from_env():
     hidden_dim2 = int(ckpt.get("hidden_dim2", max(128, hidden_dim // 2)))
     gate_bias = float(ckpt.get("gate_bias", -2.0))
     emb_dim = int(ckpt.get("emb_dim", max(1, input_dim - output_dim)))
+    adapter_class_weights = ckpt.get("adapter_class_weights")
 
     if arch == "linear":
         model = PerchAdapterHeadLinear(
@@ -1321,10 +1322,28 @@ def _load_perch_adapter_from_env():
         ).to(TORCH_DEVICE)
 
     model.load_state_dict(_sanitize_state_dict_local(ckpt["adapter_state_dict"]), strict=True)
+    if adapter_class_weights is not None:
+        adapter_class_weights = np.asarray(adapter_class_weights, dtype=np.float32)
+        if adapter_class_weights.shape[0] != output_dim:
+            raise RuntimeError(
+                f"Perch adapter class weights dim {adapter_class_weights.shape[0]} "
+                f"does not match output_dim {output_dim}."
+            )
+        model.adapter_class_weights_np = adapter_class_weights
+    else:
+        model.adapter_class_weights_np = None
     model.eval()
+    class_weight_msg = ""
+    if getattr(model, "adapter_class_weights_np", None) is not None:
+        w_arr = model.adapter_class_weights_np
+        class_weight_msg = (
+            f", class_w_mean={float(w_arr.mean()):.3f}, "
+            f"class_w_range=[{float(w_arr.min()):.3f},{float(w_arr.max()):.3f}]"
+        )
     print(
         f"[OK] Loaded Perch adapter: {ckpt_path} "
-        f"(arch={arch}, hidden={hidden_dim}, hidden2={hidden_dim2}, emb_dim={emb_dim}, weight={PERCH_ADAPTER_WEIGHT})"
+        f"(arch={arch}, hidden={hidden_dim}, hidden2={hidden_dim2}, emb_dim={emb_dim}, "
+        f"weight={PERCH_ADAPTER_WEIGHT}{class_weight_msg})"
     )
     return model
 
@@ -1340,6 +1359,9 @@ def _apply_perch_adapter(scores_raw, emb_raw, adapter_model, weight=1.0, batch_s
         x = torch.from_numpy(feat[i:j]).to(TORCH_DEVICE)
         with torch.no_grad():
             delta = adapter_model(x).detach().cpu().numpy().astype(np.float32)
+        class_weights = getattr(adapter_model, "adapter_class_weights_np", None)
+        if class_weights is not None:
+            delta = delta * class_weights[None, :]
         out[i:j] = scores_raw[i:j] + float(weight) * delta
     return out
 

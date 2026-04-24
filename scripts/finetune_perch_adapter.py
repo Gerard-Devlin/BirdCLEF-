@@ -24,6 +24,7 @@ from __future__ import annotations
 import argparse
 import ast
 import random
+import re
 import time
 from pathlib import Path
 from typing import Iterable, List
@@ -99,6 +100,17 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--dropout", type=float, default=0.2)
     p.add_argument(
+        "--class-weight-grid",
+        type=str,
+        default="0,0.05,0.1,0.15,0.2,0.25,0.3,0.4,0.5,0.7,1.0",
+        help="Comma-separated per-class adapter delta weights searched on the validation split.",
+    )
+    p.add_argument(
+        "--disable-class-weights",
+        action="store_true",
+        help="Do not store per-class adapter delta weights in the checkpoint.",
+    )
+    p.add_argument(
         "--adapter-arch",
         type=str,
         default="sep_gated2",
@@ -115,6 +127,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--include-secondary", action="store_true")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--use-gpu", action="store_true")
+    p.add_argument(
+        "--perch-cpu",
+        action="store_true",
+        help="Run Perch feature extraction on CPU even when --use-gpu trains the PyTorch head on GPU.",
+    )
     return p.parse_args()
 
 
@@ -498,11 +515,22 @@ def macro_auc(y_true: np.ndarray, y_score: np.ndarray) -> float:
     return float(roc_auc_score(y_true[:, keep], y_score[:, keep], average="macro"))
 
 
+def parse_weight_grid(raw: str) -> np.ndarray:
+    vals = []
+    for part in str(raw).split(","):
+        part = part.strip()
+        if part:
+            vals.append(float(part))
+    if not vals:
+        vals = [1.0]
+    return np.asarray(vals, dtype=np.float32)
+
+
 def build_label_mapping(
     sample_submission_csv: Path,
     taxonomy_csv: Path,
     model_dir: Path,
-) -> tuple[List[str], np.ndarray, np.ndarray]:
+) -> tuple[List[str], np.ndarray, np.ndarray, dict[int, list[int]]]:
     sample_sub = pd.read_csv(sample_submission_csv)
     taxonomy = pd.read_csv(taxonomy_csv)
     primary_labels = sample_sub.columns[1:].tolist()
@@ -522,7 +550,30 @@ def build_label_mapping(
     mapped_pos = np.where(bc_indices >= 0)[0].astype(np.int32)
     mapped_bc_idx = bc_indices[mapped_pos].astype(np.int32)
     print(f"[INFO] Label mapping: matched {len(mapped_pos)}/{len(primary_labels)} competition classes to Perch.")
-    return primary_labels, mapped_pos, mapped_bc_idx
+
+    class_name_map = taxonomy.set_index("primary_label")["class_name"].to_dict()
+    proxy_taxa = {"Amphibia", "Insecta", "Aves"}
+    unmapped_pos = np.where(bc_indices < 0)[0].astype(np.int32)
+    proxy_map: dict[int, list[int]] = {}
+    unmapped_labels = {primary_labels[i] for i in unmapped_pos}
+    unmapped_df = taxonomy[taxonomy["primary_label"].isin(unmapped_labels)].copy()
+    for _, row in unmapped_df.iterrows():
+        target = str(row["primary_label"])
+        if class_name_map.get(target) not in proxy_taxa:
+            continue
+        sci = str(row["scientific_name"])
+        parts = sci.split()
+        if not parts:
+            continue
+        genus = parts[0]
+        hits = bc_labels[
+            bc_labels["scientific_name"].astype(str).str.match(rf"^{re.escape(genus)}\s", na=False)
+        ]
+        if len(hits) > 0 and target in label_to_idx:
+            proxy_map[label_to_idx[target]] = hits["bc_index"].astype(int).tolist()
+
+    print(f"[INFO] Genus proxy: {len(proxy_map)}/{len(unmapped_pos)} unmapped classes have proxy logits.")
+    return primary_labels, mapped_pos, mapped_bc_idx, proxy_map
 
 
 def make_targets(train_df: pd.DataFrame, valid_labels: set[str], include_secondary: bool) -> List[List[str]]:
@@ -646,6 +697,42 @@ def train_adapter(
 
     if best_state is not None:
         model.load_state_dict(best_state, strict=True)
+    adapter_class_weights = np.ones(n_classes, dtype=np.float32)
+    if not args.disable_class_weights and len(va_idx) > 0:
+        grid = parse_weight_grid(args.class_weight_grid)
+        model.eval()
+        va_delta = []
+        with torch.no_grad():
+            for b in _iter_batches(va_idx, args.train_batch_size, shuffle=False):
+                x = torch.from_numpy(X[b]).to(device)
+                va_delta.append(model(x).detach().cpu().numpy().astype(np.float32))
+        delta_va = np.concatenate(va_delta, axis=0) if va_delta else np.zeros((0, n_classes), dtype=np.float32)
+        base_va = base_logits[va_idx]
+        y_va = Y[va_idx]
+        for c in range(n_classes):
+            y_c = y_va[:, c]
+            if y_c.sum() <= 0 or y_c.sum() >= len(y_c):
+                continue
+            best_w = 1.0
+            best_c_auc = -1.0
+            for w in grid:
+                score = 1.0 / (1.0 + np.exp(-np.clip(base_va[:, c] + float(w) * delta_va[:, c], -30, 30)))
+                try:
+                    auc = float(roc_auc_score(y_c, score))
+                except ValueError:
+                    continue
+                if auc > best_c_auc + 1e-12:
+                    best_c_auc = auc
+                    best_w = float(w)
+            adapter_class_weights[c] = best_w
+        adapter_meta["adapter_class_weights"] = adapter_class_weights
+        adapter_meta["class_weight_grid"] = grid
+        tuned = adapter_class_weights[np.isfinite(adapter_class_weights)]
+        print(
+            "[INFO] Adapter class weights: "
+            f"mean={float(tuned.mean()):.3f} min={float(tuned.min()):.3f} max={float(tuned.max()):.3f} "
+            f"grid={','.join(str(float(x)) for x in grid)}"
+        )
     print(f"[INFO] Adapter training done in {(time.time()-t0)/60:.1f} min | best_val_auc={best_auc:.6f}")
     return model, best_auc, adapter_meta
 
@@ -768,7 +855,7 @@ def main() -> None:
     if not args.model_dir.exists():
         raise FileNotFoundError(args.model_dir)
 
-    primary_labels, mapped_pos, mapped_bc_idx = build_label_mapping(
+    primary_labels, mapped_pos, mapped_bc_idx, proxy_map = build_label_mapping(
         args.sample_submission_csv,
         args.taxonomy_csv,
         args.model_dir,
@@ -807,9 +894,14 @@ def main() -> None:
             f"[INFO] Loaded feature cache: {args.feature_cache} | "
             f"windows={len(X)} files={len(np.unique(G))} feature_dim={X.shape[1]}"
         )
+        if proxy_map:
+            print(
+                "[WARN] Loaded an existing feature cache; genus proxy logits can only be applied "
+                "when rebuilding the cache from Perch raw logits."
+            )
 
     if not cache_loaded:
-        runner = PerchRunner(args.model_dir, onnx_path, args.use_gpu)
+        runner = PerchRunner(args.model_dir, onnx_path, args.use_gpu and not args.perch_cpu)
 
         pending_audio: List[np.ndarray] = []
         pending_targets: List[np.ndarray] = []
@@ -855,6 +947,8 @@ def main() -> None:
             mapped_scores = np.zeros((len(x), n_classes), dtype=np.float32)
             if len(mapped_pos) > 0:
                 mapped_scores[:, mapped_pos] = logits_raw[:, mapped_bc_idx]
+            for cls_idx, bc_idxs in proxy_map.items():
+                mapped_scores[:, int(cls_idx)] = logits_raw[:, bc_idxs].max(axis=1)
             feat = np.concatenate([emb, mapped_scores], axis=1).astype(np.float32, copy=False)
             feats_all.append(feat)
             base_all.append(mapped_scores)
@@ -942,6 +1036,17 @@ def main() -> None:
             "emb_dim": emb_dim,
             "output_dim": int(n_classes),
             "dropout": float(head_meta.get("dropout", args.dropout)),
+            "adapter_class_weights": (
+                head_meta.get("adapter_class_weights", np.ones(n_classes, dtype=np.float32)).astype(np.float32)
+                if args.head_type == "residual_adapter"
+                else None
+            ),
+            "class_weight_grid": (
+                head_meta.get("class_weight_grid", np.asarray([], dtype=np.float32)).astype(np.float32)
+                if args.head_type == "residual_adapter"
+                else None
+            ),
+            "genus_proxy_classes": sorted(int(k) for k in proxy_map.keys()),
             "primary_labels": primary_labels,
             "best_val_auc": float(best_auc),
             "segments_per_file": int(args.segments_per_file),
