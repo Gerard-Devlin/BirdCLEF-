@@ -255,6 +255,9 @@ GLOBAL_SEED = _env_int("BC26_SEED", 42)
 PERCH_ADAPTER_CKPT_RAW = os.environ.get("BC26_PERCH_ADAPTER_CKPT", "").strip()
 PERCH_ADAPTER_WEIGHT = _env_float("BC26_PERCH_ADAPTER_WEIGHT", 1.0)
 PERCH_ADAPTER_MODEL = None
+PERCH_EMB_CLS_CKPT_RAW = os.environ.get("BC26_PERCH_EMB_CLS_CKPT", "").strip()
+PERCH_EMB_CLS_WEIGHT = _env_float("BC26_PERCH_EMB_CLS_WEIGHT", 0.35)
+PERCH_EMB_CLS_MODEL = None
 
 np.random.seed(GLOBAL_SEED)
 random.seed(GLOBAL_SEED)
@@ -270,6 +273,11 @@ if PERCH_ADAPTER_CKPT_RAW:
     print(
         f"  perch_adapter_ckpt={PERCH_ADAPTER_CKPT_RAW} "
         f"(weight={PERCH_ADAPTER_WEIGHT})"
+    )
+if PERCH_EMB_CLS_CKPT_RAW:
+    print(
+        f"  perch_emb_cls_ckpt={PERCH_EMB_CLS_CKPT_RAW} "
+        f"(blend_weight={PERCH_EMB_CLS_WEIGHT})"
     )
  
 print("Config ready")
@@ -1188,6 +1196,36 @@ class PerchAdapterHeadSepGated(nn.Module):
         return gate * scaled_logits + bias
 
 
+class PerchEmbeddingClassifier(nn.Module):
+    """Classifier head using only Perch embeddings."""
+
+    def __init__(
+        self,
+        emb_dim=1536,
+        output_dim=234,
+        hidden_dim=512,
+        dropout=0.2,
+        arch="mlp2",
+    ):
+        super().__init__()
+        self.arch = str(arch).lower()
+        if self.arch == "linear":
+            self.net = nn.Linear(emb_dim, output_dim)
+        elif self.arch == "mlp2":
+            self.net = nn.Sequential(
+                nn.LayerNorm(emb_dim),
+                nn.Linear(emb_dim, hidden_dim),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(hidden_dim, output_dim),
+            )
+        else:
+            raise ValueError(f"Unknown embedding classifier arch: {arch}")
+
+    def forward(self, emb):
+        return self.net(emb)
+
+
 def _sanitize_state_dict_local(state_dict):
     cleaned = {}
     for k, v in state_dict.items():
@@ -1306,6 +1344,64 @@ def _apply_perch_adapter(scores_raw, emb_raw, adapter_model, weight=1.0, batch_s
     return out
 
 
+def _load_perch_embedding_classifier_from_env():
+    if not PERCH_EMB_CLS_CKPT_RAW:
+        return None
+    ckpt_path = Path(PERCH_EMB_CLS_CKPT_RAW)
+    if not ckpt_path.exists():
+        print(f"[WARN] Perch embedding classifier ckpt not found: {ckpt_path}. Skip classifier.")
+        return None
+
+    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    ckpt_labels = ckpt.get("primary_labels")
+    if ckpt_labels is not None and list(ckpt_labels) != list(PRIMARY_LABELS):
+        raise RuntimeError(
+            "Perch embedding classifier label space mismatch with current sample_submission."
+        )
+
+    state_dict = ckpt.get("classifier_state_dict")
+    if state_dict is None:
+        raise RuntimeError(
+            f"Checkpoint {ckpt_path} does not contain classifier_state_dict. "
+            "Train with --head-type embedding_classifier."
+        )
+
+    emb_dim = int(ckpt.get("emb_dim", 1536))
+    output_dim = int(ckpt.get("output_dim", N_CLASSES))
+    hidden_dim = int(ckpt.get("hidden_dim", 512))
+    dropout = float(ckpt.get("dropout", 0.2))
+    arch = str(ckpt.get("classifier_arch", "mlp2")).strip().lower() or "mlp2"
+
+    model = PerchEmbeddingClassifier(
+        emb_dim=emb_dim,
+        output_dim=output_dim,
+        hidden_dim=hidden_dim,
+        dropout=dropout,
+        arch=arch,
+    ).to(TORCH_DEVICE)
+    model.load_state_dict(_sanitize_state_dict_local(state_dict), strict=True)
+    model.eval()
+    print(
+        f"[OK] Loaded Perch embedding classifier: {ckpt_path} "
+        f"(arch={arch}, hidden={hidden_dim}, emb_dim={emb_dim}, blend_weight={PERCH_EMB_CLS_WEIGHT})"
+    )
+    return model
+
+
+def _apply_perch_embedding_classifier(scores_raw, emb_raw, classifier_model, weight=0.35, batch_size=2048):
+    if classifier_model is None or abs(weight) < 1e-12:
+        return scores_raw
+    out = np.empty_like(scores_raw, dtype=np.float32)
+    n = len(emb_raw)
+    for i in range(0, n, batch_size):
+        j = min(n, i + batch_size)
+        emb = torch.from_numpy(emb_raw[i:j].astype(np.float32, copy=False)).to(TORCH_DEVICE)
+        with torch.no_grad():
+            cls_logits = classifier_model(emb).detach().cpu().numpy().astype(np.float32)
+        out[i:j] = (1.0 - float(weight)) * scores_raw[i:j] + float(weight) * cls_logits
+    return out
+
+
 PERCH_ADAPTER_MODEL = _load_perch_adapter_from_env()
 if PERCH_ADAPTER_MODEL is not None and "sc_tr" in globals() and "emb_tr" in globals():
     t0 = time.time()
@@ -1317,6 +1413,20 @@ if PERCH_ADAPTER_MODEL is not None and "sc_tr" in globals() and "emb_tr" in glob
     )
     print(
         f"[OK] Applied Perch adapter to training cache in {time.time()-t0:.1f}s "
+        f"| score range [{sc_tr.min():.3f}, {sc_tr.max():.3f}]"
+    )
+
+PERCH_EMB_CLS_MODEL = _load_perch_embedding_classifier_from_env()
+if PERCH_EMB_CLS_MODEL is not None and "sc_tr" in globals() and "emb_tr" in globals():
+    t0 = time.time()
+    sc_tr = _apply_perch_embedding_classifier(
+        sc_tr,
+        emb_tr,
+        PERCH_EMB_CLS_MODEL,
+        weight=PERCH_EMB_CLS_WEIGHT,
+    )
+    print(
+        f"[OK] Applied Perch embedding classifier to training cache in {time.time()-t0:.1f}s "
         f"| score range [{sc_tr.min():.3f}, {sc_tr.max():.3f}]"
     )
 
@@ -2356,6 +2466,18 @@ if PERCH_ADAPTER_MODEL is not None:
     )
     print(
         f"[OK] Applied Perch adapter to test scores in {time.time()-t0:.1f}s "
+        f"| score range [{sc_te.min():.3f}, {sc_te.max():.3f}]"
+    )
+if PERCH_EMB_CLS_MODEL is not None:
+    t0 = time.time()
+    sc_te = _apply_perch_embedding_classifier(
+        sc_te,
+        emb_te,
+        PERCH_EMB_CLS_MODEL,
+        weight=PERCH_EMB_CLS_WEIGHT,
+    )
+    print(
+        f"[OK] Applied Perch embedding classifier to test scores in {time.time()-t0:.1f}s "
         f"| score range [{sc_te.min():.3f}, {sc_te.max():.3f}]"
     )
 

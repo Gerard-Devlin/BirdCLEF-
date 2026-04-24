@@ -1,14 +1,22 @@
 #!/usr/bin/env python
-"""Fine-tune a residual adapter on top of Google Perch v2 features.
+"""Fine-tune a small head on top of Google Perch v2 features.
 
 This script uses the full `train_audio` + `train.csv` split (weak labels) to
-train a residual head:
+train either a residual head:
 
     adapted_logits = perch_logits + adapter([perch_embedding, perch_logits])
+
+or a pure embedding classifier:
+
+    classifier_logits = classifier(perch_embedding)
 
 The adapter can be injected into `two_pass_ssm_pipeline_v2.py` through:
   - BC26_PERCH_ADAPTER_CKPT
   - BC26_PERCH_ADAPTER_WEIGHT
+
+The embedding classifier can be injected through:
+  - BC26_PERCH_EMB_CLS_CKPT
+  - BC26_PERCH_EMB_CLS_WEIGHT
 """
 
 from __future__ import annotations
@@ -46,7 +54,7 @@ WINDOW_SAMPLES = SR * WINDOW_SEC
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Fine-tune Perch residual adapter on train_audio.")
+    p = argparse.ArgumentParser(description="Fine-tune a small Perch head on train_audio.")
     p.add_argument("--train-csv", type=Path, default=Path("dataset/train.csv"))
     p.add_argument("--audio-dir", type=Path, default=Path("dataset/train_audio"))
     p.add_argument("--taxonomy-csv", type=Path, default=Path("dataset/taxonomy.csv"))
@@ -69,6 +77,20 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--lr", type=float, default=3e-4)
     p.add_argument("--weight-decay", type=float, default=1e-4)
     p.add_argument("--hidden-dim", type=int, default=640)
+    p.add_argument(
+        "--head-type",
+        type=str,
+        default="residual_adapter",
+        choices=["residual_adapter", "embedding_classifier"],
+        help="Train residual Perch-logit adapter or pure embedding classifier.",
+    )
+    p.add_argument(
+        "--classifier-arch",
+        type=str,
+        default="mlp2",
+        choices=["linear", "mlp2"],
+        help="Architecture for --head-type embedding_classifier.",
+    )
     p.add_argument(
         "--hidden-dim2",
         type=int,
@@ -337,6 +359,36 @@ class PerchAdapterHeadSepGated(nn.Module):
         return gate * scaled_logits + bias
 
 
+class PerchEmbeddingClassifier(nn.Module):
+    """Classifier head using only Perch embeddings."""
+
+    def __init__(
+        self,
+        emb_dim: int,
+        output_dim: int,
+        hidden_dim: int,
+        dropout: float,
+        arch: str = "mlp2",
+    ):
+        super().__init__()
+        self.arch = str(arch).lower()
+        if self.arch == "linear":
+            self.net = nn.Linear(emb_dim, output_dim)
+        elif self.arch == "mlp2":
+            self.net = nn.Sequential(
+                nn.LayerNorm(emb_dim),
+                nn.Linear(emb_dim, hidden_dim),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(hidden_dim, output_dim),
+            )
+        else:
+            raise ValueError(f"Unknown classifier arch: {arch}")
+
+    def forward(self, emb: torch.Tensor) -> torch.Tensor:
+        return self.net(emb)
+
+
 def build_adapter_model(input_dim: int, output_dim: int, args: argparse.Namespace) -> tuple[nn.Module, dict]:
     arch = str(args.adapter_arch).strip().lower()
     if arch == "linear":
@@ -408,6 +460,33 @@ def build_adapter_model(input_dim: int, output_dim: int, args: argparse.Namespac
         "gate_bias": 0.0,
         "dropout": float(args.dropout),
         "emb_dim": int(input_dim - output_dim),
+    }
+    return model, meta
+
+
+def build_embedding_classifier(input_dim: int, output_dim: int, args: argparse.Namespace) -> tuple[nn.Module, dict]:
+    emb_dim = int(input_dim - output_dim)
+    if emb_dim <= 0:
+        raise RuntimeError(
+            f"Embedding classifier expects concat features [emb, logits], got input_dim={input_dim}, "
+            f"output_dim={output_dim}"
+        )
+    arch = str(args.classifier_arch).strip().lower()
+    model = PerchEmbeddingClassifier(
+        emb_dim=emb_dim,
+        output_dim=output_dim,
+        hidden_dim=int(args.hidden_dim),
+        dropout=float(args.dropout),
+        arch=arch,
+    )
+    meta = {
+        "head_type": "embedding_classifier",
+        "classifier_arch": arch,
+        "hidden_dim": int(args.hidden_dim) if arch == "mlp2" else 0,
+        "hidden_dim2": 0,
+        "gate_bias": 0.0,
+        "dropout": float(args.dropout) if arch == "mlp2" else 0.0,
+        "emb_dim": int(emb_dim),
     }
     return model, meta
 
@@ -569,6 +648,113 @@ def train_adapter(
         model.load_state_dict(best_state, strict=True)
     print(f"[INFO] Adapter training done in {(time.time()-t0)/60:.1f} min | best_val_auc={best_auc:.6f}")
     return model, best_auc, adapter_meta
+
+
+def train_embedding_classifier(
+    X: np.ndarray,
+    Y: np.ndarray,
+    groups: np.ndarray,
+    args: argparse.Namespace,
+    n_classes: int,
+) -> tuple[nn.Module, float, dict]:
+    device = torch.device("cuda" if args.use_gpu and torch.cuda.is_available() else "cpu")
+    if args.use_gpu and device.type != "cuda":
+        raise RuntimeError("--use-gpu is set, but torch.cuda.is_available() is False.")
+    print(f"[INFO] Embedding classifier train device: {device}")
+
+    emb_dim = int(X.shape[1] - n_classes)
+    if emb_dim <= 0:
+        raise RuntimeError(f"Invalid feature dim for embedding classifier: X={X.shape}, n_classes={n_classes}")
+    E = X[:, :emb_dim].astype(np.float32, copy=False)
+
+    unique_files = np.unique(groups)
+    rng = np.random.default_rng(args.seed)
+    rng.shuffle(unique_files)
+    n_val_files = max(1, int(len(unique_files) * args.val_ratio))
+    val_file_set = set(unique_files[:n_val_files].tolist())
+    val_mask = np.array([g in val_file_set for g in groups], dtype=bool)
+    tr_idx = np.where(~val_mask)[0]
+    va_idx = np.where(val_mask)[0]
+    print(f"[INFO] Split: train_windows={len(tr_idx)}, val_windows={len(va_idx)}, files={len(unique_files)}")
+
+    y_tr = Y[tr_idx]
+    pos = y_tr.sum(axis=0).astype(np.float32)
+    neg = float(len(tr_idx)) - pos
+    pos_weight = np.clip(neg / (pos + 1.0), 1.0, 50.0)
+    pos_weight_t = torch.from_numpy(pos_weight).to(device)
+
+    model, clf_meta = build_embedding_classifier(
+        input_dim=int(X.shape[1]),
+        output_dim=n_classes,
+        args=args,
+    )
+    model = model.to(device)
+    print(
+        "[INFO] Embedding classifier arch="
+        f"{clf_meta['classifier_arch']} "
+        f"(emb_dim={clf_meta['emb_dim']}, hidden={clf_meta['hidden_dim']}, "
+        f"dropout={clf_meta['dropout']})"
+    )
+    opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+
+    best_auc = -1.0
+    best_state = None
+    wait = 0
+
+    def _iter_batches(index: np.ndarray, batch_size: int, shuffle: bool) -> Iterable[np.ndarray]:
+        idx = index.copy()
+        if shuffle:
+            rng.shuffle(idx)
+        for i in range(0, len(idx), batch_size):
+            yield idx[i : i + batch_size]
+
+    t0 = time.time()
+    for ep in range(1, args.epochs + 1):
+        model.train()
+        tr_losses = []
+        for b in _iter_batches(tr_idx, args.train_batch_size, shuffle=True):
+            emb = torch.from_numpy(E[b]).to(device)
+            y = torch.from_numpy(Y[b]).to(device)
+            logits = model(emb)
+            loss = F.binary_cross_entropy_with_logits(logits, y, pos_weight=pos_weight_t)
+            opt.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            opt.step()
+            tr_losses.append(float(loss.item()))
+
+        model.eval()
+        va_losses = []
+        va_preds = []
+        with torch.no_grad():
+            for b in _iter_batches(va_idx, args.train_batch_size, shuffle=False):
+                emb = torch.from_numpy(E[b]).to(device)
+                y = torch.from_numpy(Y[b]).to(device)
+                logits = model(emb)
+                loss = F.binary_cross_entropy_with_logits(logits, y, pos_weight=pos_weight_t)
+                va_losses.append(float(loss.item()))
+                va_preds.append(torch.sigmoid(logits).cpu().numpy())
+        va_pred = np.concatenate(va_preds, axis=0) if va_preds else np.zeros((0, n_classes), dtype=np.float32)
+        va_auc = macro_auc(Y[va_idx], va_pred) if len(va_idx) > 0 else 0.0
+        print(
+            f"Epoch {ep:02d}/{args.epochs} | "
+            f"train_loss={np.mean(tr_losses):.5f} | val_loss={np.mean(va_losses):.5f} | val_auc={va_auc:.6f}"
+        )
+
+        if va_auc > best_auc:
+            best_auc = va_auc
+            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+            wait = 0
+        else:
+            wait += 1
+            if wait >= args.patience:
+                print(f"[INFO] Early stop at epoch {ep}.")
+                break
+
+    if best_state is not None:
+        model.load_state_dict(best_state, strict=True)
+    print(f"[INFO] Embedding classifier training done in {(time.time()-t0)/60:.1f} min | best_val_auc={best_auc:.6f}")
+    return model, best_auc, clf_meta
 
 
 def main() -> None:
@@ -734,20 +920,28 @@ def main() -> None:
             )
             print(f"[OK] Saved feature cache: {args.feature_cache}")
 
-    model, best_auc, adapter_meta = train_adapter(X, B, Y, G, args, n_classes=n_classes)
+    if args.head_type == "embedding_classifier":
+        model, best_auc, head_meta = train_embedding_classifier(X, Y, G, args, n_classes=n_classes)
+        state_key = "classifier_state_dict"
+    else:
+        model, best_auc, head_meta = train_adapter(X, B, Y, G, args, n_classes=n_classes)
+        state_key = "adapter_state_dict"
 
     args.output_ckpt.parent.mkdir(parents=True, exist_ok=True)
+    emb_dim = int(head_meta.get("emb_dim", int(X.shape[1]) - n_classes))
     torch.save(
         {
-            "adapter_state_dict": model.state_dict(),
-            "adapter_arch": str(adapter_meta.get("adapter_arch", "mlp2_legacy")),
+            state_key: model.state_dict(),
+            "head_type": str(args.head_type),
+            "adapter_arch": str(head_meta.get("adapter_arch", "mlp2_legacy")),
+            "classifier_arch": str(head_meta.get("classifier_arch", "")),
             "input_dim": int(X.shape[1]),
-            "hidden_dim": int(adapter_meta.get("hidden_dim", args.hidden_dim)),
-            "hidden_dim2": int(adapter_meta.get("hidden_dim2", 0)),
-            "gate_bias": float(adapter_meta.get("gate_bias", 0.0)),
-            "emb_dim": int(adapter_meta.get("emb_dim", int(X.shape[1]) - n_classes)),
+            "hidden_dim": int(head_meta.get("hidden_dim", args.hidden_dim)),
+            "hidden_dim2": int(head_meta.get("hidden_dim2", 0)),
+            "gate_bias": float(head_meta.get("gate_bias", 0.0)),
+            "emb_dim": emb_dim,
             "output_dim": int(n_classes),
-            "dropout": float(args.dropout),
+            "dropout": float(head_meta.get("dropout", args.dropout)),
             "primary_labels": primary_labels,
             "best_val_auc": float(best_auc),
             "segments_per_file": int(args.segments_per_file),
@@ -757,7 +951,7 @@ def main() -> None:
         },
         args.output_ckpt,
     )
-    print(f"[OK] Saved adapter ckpt: {args.output_ckpt}")
+    print(f"[OK] Saved {args.head_type} ckpt: {args.output_ckpt}")
 
 
 if __name__ == "__main__":

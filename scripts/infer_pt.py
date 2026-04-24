@@ -25,6 +25,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--extra-cache-dirs", default="", help="Optional extra cache dirs (os.pathsep separated).")
     parser.add_argument("--perch-adapter", default="", help="Optional Perch adapter ckpt (.pth).")
     parser.add_argument("--perch-adapter-weight", type=float, default=1.0, help="Adapter delta weight.")
+    parser.add_argument("--perch-emb-cls", default="", help="Optional pure Perch embedding classifier ckpt (.pth).")
+    parser.add_argument("--perch-emb-cls-weight", type=float, default=0.35, help="Embedding classifier logit blend weight.")
     parser.add_argument("--input-root", default="/kaggle/input", help="Root path for wheel auto-discovery.")
     parser.add_argument(
         "--pipeline-script",
@@ -56,6 +58,9 @@ def main() -> None:
     if args.perch_adapter:
         env["BC26_PERCH_ADAPTER_CKPT"] = str(Path(args.perch_adapter))
         env["BC26_PERCH_ADAPTER_WEIGHT"] = str(float(args.perch_adapter_weight))
+    if args.perch_emb_cls:
+        env["BC26_PERCH_EMB_CLS_CKPT"] = str(Path(args.perch_emb_cls))
+        env["BC26_PERCH_EMB_CLS_WEIGHT"] = str(float(args.perch_emb_cls_weight))
 
     cmd = [sys.executable, str(pipeline_script)]
     print("Running:", " ".join(cmd))
