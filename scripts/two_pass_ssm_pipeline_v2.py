@@ -323,6 +323,7 @@ ENSEMBLE_PER_CLASS_SHRINK = _env_float("BC26_ENSEMBLE_PER_CLASS_SHRINK", 0.5)
 STACKING_ENABLE = _env_bool("BC26_STACKING_ENABLE", False)
 STACKING_MIN_POS = _env_int("BC26_STACKING_MIN_POS", 6)
 STACKING_LOGREG_C = _env_float("BC26_STACKING_LOGREG_C", 1.0)
+BAGGING_FOLDS = _env_int("BC26_BAGGING_FOLDS", 1)
 
 np.random.seed(GLOBAL_SEED)
 random.seed(GLOBAL_SEED)
@@ -398,6 +399,8 @@ if STACKING_ENABLE:
         f"TUNE: OOF stacking enabled via BC26_STACKING_ENABLE=1 "
         f"(min_pos={STACKING_MIN_POS}, C={STACKING_LOGREG_C})"
     )
+if BAGGING_FOLDS > 1:
+    print(f"TUNE: fold bagging enabled via BC26_BAGGING_FOLDS={BAGGING_FOLDS}")
 if TUNE["calib_bucketed"]:
     print(
         "TUNE: bucketed calibration enabled "
@@ -2925,6 +2928,8 @@ def run_pipeline_oof(emb_full, sc_full, Y_full, meta_full, n_splits=5):
     oof_probs = np.zeros((len(sc_full), N_CLASSES), dtype=np.float32)
     oof_proto_logits = np.zeros((len(sc_full), N_CLASSES), dtype=np.float32)
     oof_mlp_logits = np.zeros((len(sc_full), N_CLASSES), dtype=np.float32)
+    oof_first_pass_logits = np.zeros((len(sc_full), N_CLASSES), dtype=np.float32)
+    fold_artifacts = []
 
     for fold, (tr_f, va_f) in enumerate(
         gkf.split(file_meta, groups=file_meta["filename"]), 1
@@ -3105,8 +3110,29 @@ def run_pipeline_oof(emb_full, sc_full, Y_full, meta_full, n_splits=5):
                 )
 
         first_pass = _blend_ensemble_logits(proto_va, sc_va_mlp, fold_weight)
+        oof_first_pass_logits[va_mask] = first_pass.astype(np.float32, copy=False)
         probs_va = 1.0 / (1.0 + np.exp(-np.clip(first_pass, -30, 30)))
         oof_probs[va_mask] = probs_va
+
+        if BAGGING_FOLDS > 1:
+            fold_artifacts.append(
+                {
+                    "proto_state_dict": {
+                        k: v.detach().cpu()
+                        for k, v in proto_model.state_dict().items()
+                    },
+                    "site2i": dict(site2i),
+                    "probe_models": probe_models,
+                    "emb_scaler": emb_scaler,
+                    "emb_pca": emb_pca,
+                    "alpha_blend": float(alpha_blend),
+                    "ensemble_weight": (
+                        np.asarray(fold_weight, dtype=np.float32)
+                        if not np.isscalar(fold_weight)
+                        else float(fold_weight)
+                    ),
+                }
+            )
 
         fold_auc = macro_auc(Y_full[va_mask], probs_va)
         print(
@@ -3115,18 +3141,34 @@ def run_pipeline_oof(emb_full, sc_full, Y_full, meta_full, n_splits=5):
 
     overall = macro_auc(Y_full, oof_probs)
     print(f"\nFull pipeline OOF AUC: {overall:.6f}")
-    return overall, oof_probs, oof_proto_logits, oof_mlp_logits
+    return (
+        overall,
+        oof_probs,
+        oof_proto_logits,
+        oof_mlp_logits,
+        oof_first_pass_logits,
+        fold_artifacts,
+    )
 
 
 pipeline_auc, oof_pipeline = None, None
 oof_proto_logits, oof_mlp_logits = None, None
+oof_first_pass_logits, fold_bagging_artifacts = None, None
 if CFG["run_oof"]:
-    pipeline_auc, oof_pipeline, oof_proto_logits, oof_mlp_logits = run_pipeline_oof(
+    oof_splits = BAGGING_FOLDS if BAGGING_FOLDS > 1 else 5
+    (
+        pipeline_auc,
+        oof_pipeline,
+        oof_proto_logits,
+        oof_mlp_logits,
+        oof_first_pass_logits,
+        fold_bagging_artifacts,
+    ) = run_pipeline_oof(
         emb_tr,
         sc_tr,
         Y_FULL_aligned,
         meta_tr,
-        n_splits=5,
+        n_splits=oof_splits,
     )
 
 # ===== Cell 24 =====
@@ -3209,6 +3251,72 @@ if UNMAPPED_HEAD_MODEL is not None:
 def sigmoid(x):
     return 1.0 / (1.0 + np.exp(-np.clip(x, -30, 30)))
 
+
+def _predict_test_first_pass_from_fold_artifacts(emb_te, sc_te, meta_te, artifacts):
+    if not artifacts:
+        return None
+    n_test_files = len(sc_te) // N_WINDOWS
+    emb_te_f = emb_te.reshape(n_test_files, N_WINDOWS, -1)
+    sc_te_f = sc_te.reshape(n_test_files, N_WINDOWS, -1)
+    test_fnames = meta_te.drop_duplicates("filename")["filename"].tolist()
+    fold_logits = []
+
+    for i, art in enumerate(artifacts, 1):
+        site2i = dict(art["site2i"])
+        test_site_ids = np.array(
+            [
+                min(
+                    site2i.get(meta_te.loc[meta_te["filename"] == fn, "site"].iloc[0], 0),
+                    19,
+                )
+                for fn in test_fnames
+            ],
+            dtype=np.int64,
+        )
+        test_hour_ids = np.array(
+            [
+                int(meta_te.loc[meta_te["filename"] == fn, "hour_utc"].iloc[0]) % 24
+                for fn in test_fnames
+            ],
+            dtype=np.int64,
+        )
+
+        model = LightProtoSSM(
+            d_model=TUNE["proto_d_model"],
+            d_state=TUNE["proto_d_state"],
+            n_classes=N_CLASSES,
+            n_sites=20,
+            meta_dim=TUNE["proto_meta_dim"],
+            dropout=TUNE["proto_dropout"],
+            use_cross_attn=True,
+            cross_attn_heads=TUNE["proto_cross_attn_heads"],
+            n_ssm_layers=TUNE["proto_n_layers"],
+        ).to(TORCH_DEVICE)
+        model.load_state_dict(_sanitize_torch_state_dict(art["proto_state_dict"]), strict=True)
+        model.eval()
+        with torch.no_grad():
+            proto_out = model(
+                torch.tensor(emb_te_f, dtype=torch.float32, device=TORCH_DEVICE),
+                torch.tensor(sc_te_f, dtype=torch.float32, device=TORCH_DEVICE),
+                site_ids=torch.tensor(test_site_ids, dtype=torch.long, device=TORCH_DEVICE),
+                hours=torch.tensor(test_hour_ids, dtype=torch.long, device=TORCH_DEVICE),
+            ).detach().cpu().numpy()
+        proto_flat = proto_out.reshape(-1, N_CLASSES).astype(np.float32)
+        mlp_flat = apply_mlp_probes_vectorized(
+            emb_te,
+            sc_te,
+            art["probe_models"],
+            art["emb_scaler"],
+            art["emb_pca"],
+            float(art["alpha_blend"]),
+        )
+        ew = art["ensemble_weight"]
+        first_pass_fold = _blend_ensemble_logits(proto_flat, mlp_flat, ew)
+        fold_logits.append(first_pass_fold.astype(np.float32, copy=False))
+        print(f"[INFO] Bagging fold {i}/{len(artifacts)} test inference done")
+
+    return np.mean(fold_logits, axis=0).astype(np.float32, copy=False)
+
 CKPT_PATH_RAW = os.environ.get("BC26_CKPT_PATH", "").strip()
 CKPT_PATH = Path(CKPT_PATH_RAW) if CKPT_PATH_RAW else None
 LOAD_FROM_CKPT_IN_TRAIN = os.environ.get("BC26_LOAD_CKPT_IN_TRAIN", "0").strip().lower() in {"1", "true", "yes"}
@@ -3235,6 +3343,7 @@ n_sites_cap = 20
 ENSEMBLE_W = float(TUNE["ensemble_w"])
 ENSEMBLE_W_VEC = None
 STACKER = None
+FOLD_BAGGING_ARTIFACTS = None
 
 if LOAD_FROM_CKPT:
     print(f"Loading pipeline checkpoint: {CKPT_PATH}")
@@ -3262,6 +3371,9 @@ if LOAD_FROM_CKPT:
             "coef": np.asarray(_stack_coef, dtype=np.float32),
             "bias": np.asarray(_stack_bias, dtype=np.float32),
         }
+    _bag = ckpt.get("bagging_fold_artifacts")
+    if _bag:
+        FOLD_BAGGING_ARTIFACTS = _bag
     correction_weight = float(ckpt.get("correction_weight", TUNE["res_correction_weight"]))
     _pcw = ckpt.get("perch_adapter_per_class_weight")
     if _pcw is not None:
@@ -3311,6 +3423,8 @@ if LOAD_FROM_CKPT:
 
     if STACKER is not None:
         ens_msg = "stacking"
+    elif FOLD_BAGGING_ARTIFACTS:
+        ens_msg = f"bagging({len(FOLD_BAGGING_ARTIFACTS)})"
     else:
         ens_msg = (
             "per-class"
@@ -3325,6 +3439,8 @@ if LOAD_FROM_CKPT:
         f"| res_arch(d_model={res_d_model},d_state={res_d_state})"
     )
 else:
+    if fold_bagging_artifacts:
+        FOLD_BAGGING_ARTIFACTS = fold_bagging_artifacts
     t0 = time.time()
     proto_model, site2i_tr = train_light_proto_ssm(
         emb_tr, sc_tr, Y_FULL_aligned, meta_tr,
@@ -3418,6 +3534,13 @@ else:
             ENSEMBLE_W_VEC if ENSEMBLE_W_VEC is not None else ENSEMBLE_W,
         )
     )
+    if (
+        BAGGING_FOLDS > 1
+        and oof_first_pass_logits is not None
+        and oof_first_pass_logits.shape == first_pass_tr.shape
+    ):
+        first_pass_tr = oof_first_pass_logits.astype(np.float32, copy=False)
+        print("[INFO] Using OOF bagged first-pass logits for calibration/residual training")
 
     train_probs_for_calib = sigmoid(first_pass_tr)
     calib_probs = train_probs_for_calib
@@ -3508,6 +3631,7 @@ else:
                     if STACKER is not None
                     else None
                 ),
+                "bagging_fold_artifacts": FOLD_BAGGING_ARTIFACTS,
                 "correction_weight": float(correction_weight),
                 "temperatures": temperatures.astype(np.float32),
                 "per_class_thresholds": PER_CLASS_THRESHOLDS.astype(np.float32),
@@ -3561,15 +3685,21 @@ sc_te_adjusted = apply_mlp_probes_vectorized(
     emb_te, sc_te_adjusted,
     probe_models, emb_scaler, emb_pca, alpha_blend,
 )
-first_pass_flat = (
-    apply_logit_stacker(proto_scores_flat, sc_te_adjusted, STACKER)
-    if STACKER is not None
-    else _blend_ensemble_logits(
-        proto_scores_flat,
-        sc_te_adjusted,
-        ENSEMBLE_W_VEC if ENSEMBLE_W_VEC is not None else ENSEMBLE_W,
+if FOLD_BAGGING_ARTIFACTS:
+    first_pass_flat = _predict_test_first_pass_from_fold_artifacts(
+        emb_te, sc_te, meta_te, FOLD_BAGGING_ARTIFACTS
     )
-)
+    print(f"[INFO] Using bagged first-pass logits from {len(FOLD_BAGGING_ARTIFACTS)} folds")
+else:
+    first_pass_flat = (
+        apply_logit_stacker(proto_scores_flat, sc_te_adjusted, STACKER)
+        if STACKER is not None
+        else _blend_ensemble_logits(
+            proto_scores_flat,
+            sc_te_adjusted,
+            ENSEMBLE_W_VEC if ENSEMBLE_W_VEC is not None else ENSEMBLE_W,
+        )
+    )
 
 first_pass_te_f  = first_pass_flat.reshape(n_test_files, N_WINDOWS, -1)
 res_model.eval()
