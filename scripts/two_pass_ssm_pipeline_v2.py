@@ -320,6 +320,9 @@ ENSEMBLE_PER_CLASS = _env_bool("BC26_ENSEMBLE_PER_CLASS", False)
 ENSEMBLE_PER_FOLD = _env_bool("BC26_ENSEMBLE_PER_FOLD", False)
 ENSEMBLE_PER_CLASS_MIN_POS = _env_int("BC26_ENSEMBLE_PER_CLASS_MIN_POS", 6)
 ENSEMBLE_PER_CLASS_SHRINK = _env_float("BC26_ENSEMBLE_PER_CLASS_SHRINK", 0.5)
+STACKING_ENABLE = _env_bool("BC26_STACKING_ENABLE", False)
+STACKING_MIN_POS = _env_int("BC26_STACKING_MIN_POS", 6)
+STACKING_LOGREG_C = _env_float("BC26_STACKING_LOGREG_C", 1.0)
 
 np.random.seed(GLOBAL_SEED)
 random.seed(GLOBAL_SEED)
@@ -390,6 +393,11 @@ if ENSEMBLE_PER_CLASS:
     print("TUNE: per-class ensemble weight enabled via BC26_ENSEMBLE_PER_CLASS=1")
 if ENSEMBLE_PER_FOLD:
     print("TUNE: per-fold ensemble weight enabled via BC26_ENSEMBLE_PER_FOLD=1")
+if STACKING_ENABLE:
+    print(
+        f"TUNE: OOF stacking enabled via BC26_STACKING_ENABLE=1 "
+        f"(min_pos={STACKING_MIN_POS}, C={STACKING_LOGREG_C})"
+    )
 if TUNE["calib_bucketed"]:
     print(
         "TUNE: bucketed calibration enabled "
@@ -1056,6 +1064,7 @@ print(f"[OK] Temperatures: {n_event} event species (T=1.10), {n_texture} texture
 from sklearn.decomposition import PCA
 from sklearn.preprocessing import StandardScaler
 from sklearn.neural_network import MLPClassifier
+from sklearn.linear_model import LogisticRegression
 
 def build_class_freq_weights(Y, cap=10.0):
     total     = Y.shape[0]
@@ -1649,6 +1658,63 @@ def _blend_ensemble_logits(proto_logits, mlp_logits, weight):
             f"expected ({proto_logits.shape[1]},)."
         )
     return (proto_logits * w_arr[None, :] + mlp_logits * (1.0 - w_arr[None, :])).astype(np.float32, copy=False)
+
+
+def train_oof_logit_stacker(proto_logits, mlp_logits, y_true, min_pos=6, c_value=1.0):
+    n_classes = proto_logits.shape[1]
+    coef = np.zeros((n_classes, 2), dtype=np.float32)
+    bias = np.zeros(n_classes, dtype=np.float32)
+    default_coef = np.array([0.5, 0.5], dtype=np.float32)
+    tuned = 0
+    for c in range(n_classes):
+        yc = y_true[:, c].astype(np.int32)
+        pos = int(yc.sum())
+        neg = int(len(yc) - pos)
+        if pos < int(min_pos) or neg < int(min_pos):
+            coef[c] = default_coef
+            bias[c] = 0.0
+            continue
+        x = np.stack([proto_logits[:, c], mlp_logits[:, c]], axis=1).astype(np.float32, copy=False)
+        try:
+            clf = LogisticRegression(
+                penalty="l2",
+                C=float(c_value),
+                solver="liblinear",
+                max_iter=300,
+            )
+            clf.fit(x, yc)
+            coef[c] = clf.coef_[0].astype(np.float32)
+            bias[c] = np.float32(clf.intercept_[0])
+            tuned += 1
+        except Exception:
+            coef[c] = default_coef
+            bias[c] = 0.0
+    print(
+        f"[INFO] OOF stacker trained for {tuned}/{n_classes} classes "
+        f"| min_pos>={int(min_pos)} C={float(c_value):.4g}"
+    )
+    return {"coef": coef, "bias": bias}
+
+
+def apply_logit_stacker(proto_logits, mlp_logits, stacker):
+    if stacker is None:
+        return _blend_ensemble_logits(proto_logits, mlp_logits, float(TUNE["ensemble_w"]))
+    coef = np.asarray(stacker["coef"], dtype=np.float32)
+    bias = np.asarray(stacker["bias"], dtype=np.float32)
+    if coef.shape != (proto_logits.shape[1], 2):
+        raise RuntimeError(
+            f"Stacker coef shape mismatch: got {coef.shape}, expected ({proto_logits.shape[1]}, 2)"
+        )
+    if bias.shape != (proto_logits.shape[1],):
+        raise RuntimeError(
+            f"Stacker bias shape mismatch: got {bias.shape}, expected ({proto_logits.shape[1]},)"
+        )
+    out = (
+        proto_logits * coef[:, 0][None, :]
+        + mlp_logits * coef[:, 1][None, :]
+        + bias[None, :]
+    )
+    return out.astype(np.float32, copy=False)
 
 
 def _load_perch_embedding_classifier_from_env():
@@ -2857,6 +2923,8 @@ def run_pipeline_oof(emb_full, sc_full, Y_full, meta_full, n_splits=5):
 
     gkf = GroupKFold(n_splits=n_splits)
     oof_probs = np.zeros((len(sc_full), N_CLASSES), dtype=np.float32)
+    oof_proto_logits = np.zeros((len(sc_full), N_CLASSES), dtype=np.float32)
+    oof_mlp_logits = np.zeros((len(sc_full), N_CLASSES), dtype=np.float32)
 
     for fold, (tr_f, va_f) in enumerate(
         gkf.split(file_meta, groups=file_meta["filename"]), 1
@@ -2962,6 +3030,8 @@ def run_pipeline_oof(emb_full, sc_full, Y_full, meta_full, n_splits=5):
             emb_pca,
             alpha_blend,
         )
+        oof_proto_logits[va_mask] = proto_va.astype(np.float32, copy=False)
+        oof_mlp_logits[va_mask] = sc_va_mlp.astype(np.float32, copy=False)
 
         fold_weight = float(TUNE["ensemble_w"])
         if ENSEMBLE_PER_FOLD:
@@ -3045,12 +3115,13 @@ def run_pipeline_oof(emb_full, sc_full, Y_full, meta_full, n_splits=5):
 
     overall = macro_auc(Y_full, oof_probs)
     print(f"\nFull pipeline OOF AUC: {overall:.6f}")
-    return overall, oof_probs
+    return overall, oof_probs, oof_proto_logits, oof_mlp_logits
 
 
 pipeline_auc, oof_pipeline = None, None
+oof_proto_logits, oof_mlp_logits = None, None
 if CFG["run_oof"]:
-    pipeline_auc, oof_pipeline = run_pipeline_oof(
+    pipeline_auc, oof_pipeline, oof_proto_logits, oof_mlp_logits = run_pipeline_oof(
         emb_tr,
         sc_tr,
         Y_FULL_aligned,
@@ -3163,6 +3234,7 @@ def _sanitize_torch_state_dict(state_dict):
 n_sites_cap = 20
 ENSEMBLE_W = float(TUNE["ensemble_w"])
 ENSEMBLE_W_VEC = None
+STACKER = None
 
 if LOAD_FROM_CKPT:
     print(f"Loading pipeline checkpoint: {CKPT_PATH}")
@@ -3183,6 +3255,13 @@ if LOAD_FROM_CKPT:
     _ewv = ckpt.get("ensemble_w_vec")
     if _ewv is not None:
         ENSEMBLE_W_VEC = np.asarray(_ewv, dtype=np.float32)
+    _stack_coef = ckpt.get("stacking_coef")
+    _stack_bias = ckpt.get("stacking_bias")
+    if _stack_coef is not None and _stack_bias is not None:
+        STACKER = {
+            "coef": np.asarray(_stack_coef, dtype=np.float32),
+            "bias": np.asarray(_stack_bias, dtype=np.float32),
+        }
     correction_weight = float(ckpt.get("correction_weight", TUNE["res_correction_weight"]))
     _pcw = ckpt.get("perch_adapter_per_class_weight")
     if _pcw is not None:
@@ -3230,11 +3309,14 @@ if LOAD_FROM_CKPT:
     res_model.load_state_dict(res_sd, strict=True)
     res_model.eval()
 
-    ens_msg = (
-        "per-class"
-        if ENSEMBLE_W_VEC is not None
-        else f"{ENSEMBLE_W:.3f}"
-    )
+    if STACKER is not None:
+        ens_msg = "stacking"
+    else:
+        ens_msg = (
+            "per-class"
+            if ENSEMBLE_W_VEC is not None
+            else f"{ENSEMBLE_W:.3f}"
+        )
     print(
         f"Checkpoint loaded: probes={len(probe_models)} "
         f"| n_sites_cap={n_sites_cap} | alpha_blend={alpha_blend:.3f} "
@@ -3313,10 +3395,28 @@ else:
             Y_FULL_aligned,
             default_w=float(ENSEMBLE_W),
         )
-    first_pass_tr = _blend_ensemble_logits(
-        proto_tr_flat,
-        sc_tr_mlp,
-        ENSEMBLE_W_VEC if ENSEMBLE_W_VEC is not None else ENSEMBLE_W,
+    if STACKING_ENABLE and oof_proto_logits is not None and oof_mlp_logits is not None:
+        STACKER = train_oof_logit_stacker(
+            oof_proto_logits,
+            oof_mlp_logits,
+            Y_FULL_aligned,
+            min_pos=STACKING_MIN_POS,
+            c_value=STACKING_LOGREG_C,
+        )
+        oof_stacked_logits = apply_logit_stacker(oof_proto_logits, oof_mlp_logits, STACKER)
+        oof_pipeline = sigmoid(oof_stacked_logits)
+        stack_auc = macro_auc(Y_FULL_aligned, oof_pipeline)
+        print(f"[INFO] OOF stacker macro-AUC: {stack_auc:.6f}")
+    elif STACKING_ENABLE:
+        print("[WARN] Stacking enabled but OOF branch logits unavailable; fallback to weighted blend.")
+    first_pass_tr = (
+        apply_logit_stacker(proto_tr_flat, sc_tr_mlp, STACKER)
+        if STACKER is not None
+        else _blend_ensemble_logits(
+            proto_tr_flat,
+            sc_tr_mlp,
+            ENSEMBLE_W_VEC if ENSEMBLE_W_VEC is not None else ENSEMBLE_W,
+        )
     )
 
     train_probs_for_calib = sigmoid(first_pass_tr)
@@ -3398,6 +3498,16 @@ else:
                     if ENSEMBLE_W_VEC is not None
                     else None
                 ),
+                "stacking_coef": (
+                    STACKER["coef"].astype(np.float32)
+                    if STACKER is not None
+                    else None
+                ),
+                "stacking_bias": (
+                    STACKER["bias"].astype(np.float32)
+                    if STACKER is not None
+                    else None
+                ),
                 "correction_weight": float(correction_weight),
                 "temperatures": temperatures.astype(np.float32),
                 "per_class_thresholds": PER_CLASS_THRESHOLDS.astype(np.float32),
@@ -3451,10 +3561,14 @@ sc_te_adjusted = apply_mlp_probes_vectorized(
     emb_te, sc_te_adjusted,
     probe_models, emb_scaler, emb_pca, alpha_blend,
 )
-first_pass_flat = _blend_ensemble_logits(
-    proto_scores_flat,
-    sc_te_adjusted,
-    ENSEMBLE_W_VEC if ENSEMBLE_W_VEC is not None else ENSEMBLE_W,
+first_pass_flat = (
+    apply_logit_stacker(proto_scores_flat, sc_te_adjusted, STACKER)
+    if STACKER is not None
+    else _blend_ensemble_logits(
+        proto_scores_flat,
+        sc_te_adjusted,
+        ENSEMBLE_W_VEC if ENSEMBLE_W_VEC is not None else ENSEMBLE_W,
+    )
 )
 
 first_pass_te_f  = first_pass_flat.reshape(n_test_files, N_WINDOWS, -1)
