@@ -254,6 +254,17 @@ TUNE = {
         "BC26_THRESHOLD_GRID",
         [0.25, 0.30, 0.35, 0.40, 0.45, 0.50, 0.55, 0.60, 0.65, 0.70],
     ),
+    "threshold_grid_rare": _env_float_list(
+        "BC26_THRESHOLD_GRID_RARE",
+        [0.20, 0.25, 0.30, 0.35, 0.40, 0.45, 0.50],
+    ),
+    "threshold_grid_common": _env_float_list(
+        "BC26_THRESHOLD_GRID_COMMON",
+        [0.30, 0.35, 0.40, 0.45, 0.50, 0.55, 0.60, 0.65, 0.70],
+    ),
+    "calib_bucketed": _env_bool("BC26_CALIB_BUCKETED", False),
+    "calib_rare_pos_max": _env_int("BC26_CALIB_RARE_POS_MAX", 5),
+    "calib_common_pos_min": _env_int("BC26_CALIB_COMMON_POS_MIN", 20),
     "post_topk": _env_int("BC26_POST_TOPK", 2),
     "post_conf_power": _env_float("BC26_POST_CONF_POWER", 0.4),
     "post_rank_power": _env_float("BC26_POST_RANK_POWER", 0.4),
@@ -304,6 +315,8 @@ ENSEMBLE_W_GRID = _env_float_list(
     "BC26_ENSEMBLE_W_GRID",
     [0.20, 0.30, 0.40, 0.50, 0.60, 0.70, 0.80],
 )
+ENSEMBLE_PER_CLASS = _env_bool("BC26_ENSEMBLE_PER_CLASS", False)
+ENSEMBLE_PER_FOLD = _env_bool("BC26_ENSEMBLE_PER_FOLD", False)
 
 np.random.seed(GLOBAL_SEED)
 random.seed(GLOBAL_SEED)
@@ -370,6 +383,15 @@ print(
     f"calib(min_pos_files={TUNE['calib_min_pos_files']},default_t={TUNE['calib_default_threshold']}) "
     f"tta(shifts={TUNE['tta_shifts']})"
 )
+if ENSEMBLE_PER_CLASS:
+    print("TUNE: per-class ensemble weight enabled via BC26_ENSEMBLE_PER_CLASS=1")
+if ENSEMBLE_PER_FOLD:
+    print("TUNE: per-fold ensemble weight enabled via BC26_ENSEMBLE_PER_FOLD=1")
+if TUNE["calib_bucketed"]:
+    print(
+        "TUNE: bucketed calibration enabled "
+        f"(rare<= {TUNE['calib_rare_pos_max']}, common>= {TUNE['calib_common_pos_min']})"
+    )
 if DISABLE_EARLY_STOP:
     print("TUNE: early stopping disabled via BC26_DISABLE_EARLY_STOP=1")
 if DISABLE_GENUS_PROXY:
@@ -1576,6 +1598,52 @@ def _auto_tune_ensemble_weight(proto_logits, mlp_logits, y_true):
     return best_w
 
 
+def _auto_tune_ensemble_weight_per_class(proto_logits, mlp_logits, y_true, default_w):
+    n_classes = proto_logits.shape[1]
+    out = np.full(n_classes, float(default_w), dtype=np.float32)
+    tuned = 0
+    for c in range(n_classes):
+        yc = y_true[:, c].astype(np.int32)
+        pos = int(yc.sum())
+        neg = int(len(yc) - pos)
+        if pos < 3 or neg < 3:
+            continue
+        p = proto_logits[:, c]
+        m = mlp_logits[:, c]
+        best_w = float(default_w)
+        best_auc = -1.0
+        for w in ENSEMBLE_W_GRID:
+            logits = float(w) * p + (1.0 - float(w)) * m
+            probs = 1.0 / (1.0 + np.exp(-np.clip(logits, -30, 30)))
+            try:
+                auc = roc_auc_score(yc, probs)
+            except Exception:
+                continue
+            if auc > best_auc + 1e-12:
+                best_auc = float(auc)
+                best_w = float(w)
+        out[c] = best_w
+        tuned += 1
+    print(
+        f"[INFO] Per-class ensemble weight tuned for {tuned}/{n_classes} classes "
+        f"| mean={float(out.mean()):.4f} min={float(out.min()):.4f} max={float(out.max()):.4f}"
+    )
+    return out
+
+
+def _blend_ensemble_logits(proto_logits, mlp_logits, weight):
+    if np.isscalar(weight):
+        w = float(weight)
+        return (w * proto_logits + (1.0 - w) * mlp_logits).astype(np.float32, copy=False)
+    w_arr = np.asarray(weight, dtype=np.float32)
+    if w_arr.ndim != 1 or w_arr.shape[0] != proto_logits.shape[1]:
+        raise RuntimeError(
+            f"Ensemble per-class weight shape mismatch: got {w_arr.shape}, "
+            f"expected ({proto_logits.shape[1]},)."
+        )
+    return (proto_logits * w_arr[None, :] + mlp_logits * (1.0 - w_arr[None, :])).astype(np.float32, copy=False)
+
+
 def _load_perch_embedding_classifier_from_env():
     if not PERCH_EMB_CLS_CKPT_RAW:
         return None
@@ -1975,7 +2043,12 @@ from sklearn.isotonic import IsotonicRegression
 
 def calibrate_and_optimize_thresholds(oof_probs, Y_FULL,
                                        threshold_grid=None, n_windows=12,
-                                       min_pos_files=3, default_threshold=0.5):
+                                       min_pos_files=3, default_threshold=0.5,
+                                       bucketed=False,
+                                       rare_pos_max=5,
+                                       common_pos_min=20,
+                                       threshold_grid_rare=None,
+                                       threshold_grid_common=None):
     """
     CHANGE 2: For each species:
     1. Fit isotonic regression on OOF scores (calibrates overconfident/underconfident classes)
@@ -2005,7 +2078,15 @@ def calibrate_and_optimize_thresholds(oof_probs, Y_FULL,
             y_cal = y_prob
         
         best_f1, best_t = 0.0, 0.5
-        for t in threshold_grid:
+        grid = threshold_grid
+        pos_count = int(y_true.sum())
+        if bucketed:
+            if pos_count <= int(rare_pos_max) and threshold_grid_rare is not None:
+                grid = threshold_grid_rare
+            elif pos_count >= int(common_pos_min) and threshold_grid_common is not None:
+                grid = threshold_grid_common
+
+        for t in grid:
             pred = (y_cal >= t).astype(int)
             tp = ((pred==1) & (y_true==1)).sum()
             fp = ((pred==1) & (y_true==0)).sum()
@@ -2875,7 +2956,78 @@ def run_pipeline_oof(emb_full, sc_full, Y_full, meta_full, n_splits=5):
             alpha_blend,
         )
 
-        first_pass = TUNE["ensemble_w"] * proto_va + (1.0 - TUNE["ensemble_w"]) * sc_va_mlp
+        fold_weight = float(TUNE["ensemble_w"])
+        if ENSEMBLE_PER_FOLD:
+            n_tr = len(emb_tr_f) // N_WINDOWS
+            tr_fn_list = (
+                meta_tr_f.drop_duplicates("filename")["filename"].tolist()
+            )
+            tr_site_ids = np.array(
+                [
+                    min(
+                        site2i.get(
+                            meta_tr_f.loc[
+                                meta_tr_f["filename"] == fn, "site"
+                            ].iloc[0],
+                            0,
+                        ),
+                        19,
+                    )
+                    for fn in tr_fn_list
+                ],
+                dtype=np.int64,
+            )
+            tr_hour_ids = np.array(
+                [
+                    int(
+                        meta_tr_f.loc[
+                            meta_tr_f["filename"] == fn, "hour_utc"
+                        ].iloc[0]
+                    )
+                    % 24
+                    for fn in tr_fn_list
+                ],
+                dtype=np.int64,
+            )
+            proto_model.eval()
+            with torch.no_grad():
+                proto_tr = proto_model(
+                    torch.tensor(
+                        emb_tr_f.reshape(n_tr, N_WINDOWS, -1),
+                        dtype=torch.float32,
+                        device=TORCH_DEVICE,
+                    ),
+                    torch.tensor(
+                        sc_tr_f.reshape(n_tr, N_WINDOWS, -1),
+                        dtype=torch.float32,
+                        device=TORCH_DEVICE,
+                    ),
+                    site_ids=torch.tensor(tr_site_ids, dtype=torch.long, device=TORCH_DEVICE),
+                    hours=torch.tensor(tr_hour_ids, dtype=torch.long, device=TORCH_DEVICE),
+                ).detach().cpu().numpy().reshape(-1, N_CLASSES)
+            sc_tr_mlp_fold = apply_mlp_probes_vectorized(
+                emb_tr_f,
+                sc_tr_f,
+                probe_models,
+                emb_scaler,
+                emb_pca,
+                alpha_blend,
+            )
+            if ENSEMBLE_PER_CLASS:
+                fold_weight = _auto_tune_ensemble_weight_per_class(
+                    proto_tr,
+                    sc_tr_mlp_fold,
+                    Y_tr_f,
+                    default_w=float(TUNE["ensemble_w"]),
+                )
+            else:
+                fold_weight = _auto_tune_ensemble_weight(
+                    proto_tr,
+                    sc_tr_mlp_fold,
+                    Y_tr_f,
+                )
+
+        first_pass = _blend_ensemble_logits(proto_va, sc_va_mlp, fold_weight)
         probs_va = 1.0 / (1.0 + np.exp(-np.clip(first_pass, -30, 30)))
         oof_probs[va_mask] = probs_va
 
@@ -3002,6 +3154,7 @@ def _sanitize_torch_state_dict(state_dict):
 
 n_sites_cap = 20
 ENSEMBLE_W = float(TUNE["ensemble_w"])
+ENSEMBLE_W_VEC = None
 
 if LOAD_FROM_CKPT:
     print(f"Loading pipeline checkpoint: {CKPT_PATH}")
@@ -3019,6 +3172,9 @@ if LOAD_FROM_CKPT:
     emb_pca = ckpt["emb_pca"]
     alpha_blend = float(ckpt.get("alpha_blend", TUNE["mlp_alpha_blend"]))
     ENSEMBLE_W = float(ckpt.get("ensemble_w", TUNE["ensemble_w"]))
+    _ewv = ckpt.get("ensemble_w_vec")
+    if _ewv is not None:
+        ENSEMBLE_W_VEC = np.asarray(_ewv, dtype=np.float32)
     correction_weight = float(ckpt.get("correction_weight", TUNE["res_correction_weight"]))
     _pcw = ckpt.get("perch_adapter_per_class_weight")
     if _pcw is not None:
@@ -3066,9 +3222,15 @@ if LOAD_FROM_CKPT:
     res_model.load_state_dict(res_sd, strict=True)
     res_model.eval()
 
+    ens_msg = (
+        "per-class"
+        if ENSEMBLE_W_VEC is not None
+        else f"{ENSEMBLE_W:.3f}"
+    )
     print(
         f"Checkpoint loaded: probes={len(probe_models)} "
         f"| n_sites_cap={n_sites_cap} | alpha_blend={alpha_blend:.3f} "
+        f"| ensemble={ens_msg} "
         f"| proto_arch(d_model={proto_d_model},d_state={proto_d_state},layers={proto_n_layers},heads={proto_cross_attn_heads}) "
         f"| res_arch(d_model={res_d_model},d_state={res_d_state})"
     )
@@ -3136,8 +3298,18 @@ else:
             sc_tr_mlp,
             Y_FULL_aligned,
         )
-    first_pass_tr = (ENSEMBLE_W * proto_tr_flat
-                     + (1.0 - ENSEMBLE_W) * sc_tr_mlp)
+    if ENSEMBLE_PER_CLASS:
+        ENSEMBLE_W_VEC = _auto_tune_ensemble_weight_per_class(
+            proto_tr_flat,
+            sc_tr_mlp,
+            Y_FULL_aligned,
+            default_w=float(ENSEMBLE_W),
+        )
+    first_pass_tr = _blend_ensemble_logits(
+        proto_tr_flat,
+        sc_tr_mlp,
+        ENSEMBLE_W_VEC if ENSEMBLE_W_VEC is not None else ENSEMBLE_W,
+    )
 
     train_probs_for_calib = sigmoid(first_pass_tr)
     PER_CLASS_THRESHOLDS = calibrate_and_optimize_thresholds(
@@ -3147,6 +3319,11 @@ else:
         n_windows=N_WINDOWS,
         min_pos_files=TUNE["calib_min_pos_files"],
         default_threshold=TUNE["calib_default_threshold"],
+        bucketed=TUNE["calib_bucketed"],
+        rare_pos_max=TUNE["calib_rare_pos_max"],
+        common_pos_min=TUNE["calib_common_pos_min"],
+        threshold_grid_rare=TUNE["threshold_grid_rare"],
+        threshold_grid_common=TUNE["threshold_grid_common"],
     )
 
     t0 = time.time()
@@ -3198,6 +3375,11 @@ else:
                 "emb_pca": emb_pca,
                 "alpha_blend": float(alpha_blend),
                 "ensemble_w": float(ENSEMBLE_W),
+                "ensemble_w_vec": (
+                    ENSEMBLE_W_VEC.astype(np.float32)
+                    if ENSEMBLE_W_VEC is not None
+                    else None
+                ),
                 "correction_weight": float(correction_weight),
                 "temperatures": temperatures.astype(np.float32),
                 "per_class_thresholds": PER_CLASS_THRESHOLDS.astype(np.float32),
@@ -3251,8 +3433,11 @@ sc_te_adjusted = apply_mlp_probes_vectorized(
     emb_te, sc_te_adjusted,
     probe_models, emb_scaler, emb_pca, alpha_blend,
 )
-first_pass_flat = (ENSEMBLE_W * proto_scores_flat
-                   + (1.0 - ENSEMBLE_W) * sc_te_adjusted)
+first_pass_flat = _blend_ensemble_logits(
+    proto_scores_flat,
+    sc_te_adjusted,
+    ENSEMBLE_W_VEC if ENSEMBLE_W_VEC is not None else ENSEMBLE_W,
+)
 
 first_pass_te_f  = first_pass_flat.reshape(n_test_files, N_WINDOWS, -1)
 res_model.eval()
