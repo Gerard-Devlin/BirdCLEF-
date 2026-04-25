@@ -237,6 +237,16 @@ TUNE = {
     "mlp_min_pos": _env_int("BC26_MLP_MIN_POS", 5),
     "mlp_pca_dim": _env_int("BC26_MLP_PCA_DIM", 64),
     "mlp_alpha_blend": _env_float("BC26_MLP_ALPHA_BLEND", 0.4),
+    "mlp_probe_hidden1": _env_int("BC26_MLP_PROBE_HIDDEN1", 128),
+    "mlp_probe_hidden2": _env_int("BC26_MLP_PROBE_HIDDEN2", 64),
+    "mlp_probe_max_iter": _env_int("BC26_MLP_PROBE_MAX_ITER", 300),
+    "mlp_probe_max_rows": _env_int("BC26_MLP_PROBE_MAX_ROWS", 3000),
+    "mlp_probe_n_iter_no_change": _env_int("BC26_MLP_PROBE_N_ITER_NO_CHANGE", 15),
+    "mlp_probe_lr_init": _env_float("BC26_MLP_PROBE_LR_INIT", 5e-4),
+    "mlp_probe_alpha": _env_float("BC26_MLP_PROBE_ALPHA", 0.005),
+    "mlp_probe_max_repeat": _env_int("BC26_MLP_PROBE_MAX_REPEAT", 8),
+    "calib_min_pos_files": _env_int("BC26_CALIB_MIN_POS_FILES", 3),
+    "calib_default_threshold": _env_float("BC26_CALIB_DEFAULT_THRESHOLD", 0.5),
     "prior_lambda": _env_float("BC26_PRIOR_LAMBDA", 0.4),
     "ensemble_w": _env_float("BC26_ENSEMBLE_W", 0.5),
     "tta_shifts": _env_int_list("BC26_TTA_SHIFTS", [0, 1, -1, 2, -2]),
@@ -331,7 +341,10 @@ print(
     f"(d_model={TUNE['proto_d_model']},d_state={TUNE['proto_d_state']},layers={TUNE['proto_n_layers']},heads={TUNE['proto_cross_attn_heads']}) "
     f"res={TUNE['res_epochs']}ep/{TUNE['res_patience']}pat@{TUNE['res_lr']} "
     f"(d_model={TUNE['res_d_model']},d_state={TUNE['res_d_state']}) "
-    f"mlp(min_pos={TUNE['mlp_min_pos']},pca={TUNE['mlp_pca_dim']},alpha={TUNE['mlp_alpha_blend']})"
+    f"mlp(min_pos={TUNE['mlp_min_pos']},pca={TUNE['mlp_pca_dim']},alpha={TUNE['mlp_alpha_blend']},"
+    f"hidden=({TUNE['mlp_probe_hidden1']},{TUNE['mlp_probe_hidden2']}),max_iter={TUNE['mlp_probe_max_iter']}) "
+    f"calib(min_pos_files={TUNE['calib_min_pos_files']},default_t={TUNE['calib_default_threshold']}) "
+    f"tta(shifts={TUNE['tta_shifts']})"
 )
 if DISABLE_EARLY_STOP:
     print("TUNE: early stopping disabled via BC26_DISABLE_EARLY_STOP=1")
@@ -1034,7 +1047,14 @@ def train_mlp_probes(emb, scores_raw, Y, min_pos=5, pca_dim=64, alpha_blend=0.4)
     active = np.where(Y.sum(axis=0) >= min_pos)[0]
     print(f"Training MLP probes for {len(active)} species (>= {min_pos} pos windows)...")
 
-    MAX_ROWS = 3000
+    MAX_ROWS = int(TUNE["mlp_probe_max_rows"])
+    hidden1 = int(TUNE["mlp_probe_hidden1"])
+    hidden2 = int(TUNE["mlp_probe_hidden2"])
+    max_iter = int(TUNE["mlp_probe_max_iter"])
+    n_iter_no_change = int(TUNE["mlp_probe_n_iter_no_change"])
+    lr_init = float(TUNE["mlp_probe_lr_init"])
+    reg_alpha = float(TUNE["mlp_probe_alpha"])
+    max_repeat = int(TUNE["mlp_probe_max_repeat"])
 
     for ci in tqdm(active, desc="MLP probes"):
         y = Y[:, ci]
@@ -1054,7 +1074,7 @@ def train_mlp_probes(emb, scores_raw, Y, min_pos=5, pca_dim=64, alpha_blend=0.4)
 
         w      = float(class_weights[ci])
         repeat = max(1, int(round(w * n_neg / max(n_pos, 1))))
-        repeat = min(repeat, 8)
+        repeat = min(repeat, max_repeat)
         if n_pos * repeat + len(y) > MAX_ROWS:
             repeat = max(1, (MAX_ROWS - len(y)) // max(n_pos, 1))
 
@@ -1062,15 +1082,15 @@ def train_mlp_probes(emb, scores_raw, Y, min_pos=5, pca_dim=64, alpha_blend=0.4)
         y_bal = np.concatenate([y, np.ones(n_pos * repeat, dtype=y.dtype)])
 
         clf = MLPClassifier(
-            hidden_layer_sizes=(128, 64),
+            hidden_layer_sizes=(hidden1, hidden2),
             activation="relu",
-            max_iter=300,
+            max_iter=max_iter,
             early_stopping=True,
             validation_fraction=0.15,
-            n_iter_no_change=15,
+            n_iter_no_change=n_iter_no_change,
             random_state=GLOBAL_SEED,
-            learning_rate_init=5e-4,
-            alpha=0.005,
+            learning_rate_init=lr_init,
+            alpha=reg_alpha,
         )
         clf.fit(X_bal, y_bal)
         probe_models[ci] = clf
@@ -1095,7 +1115,11 @@ def apply_mlp_probes(emb_test, scores_test, probe_models, scaler, pca, alpha_ble
         result[:, ci] = (1 - alpha_blend) * scores_test[:, ci] + alpha_blend * logit
     return result
 
-print("[OK] CHANGE 1: Upgraded MLP probe (pca_dim=64, hidden=(128,64), max_iter=300, min_pos=5)")
+print(
+    "[OK] CHANGE 1: Upgraded MLP probe "
+    f"(pca_dim={TUNE['mlp_pca_dim']}, hidden=({TUNE['mlp_probe_hidden1']},{TUNE['mlp_probe_hidden2']}), "
+    f"max_iter={TUNE['mlp_probe_max_iter']}, min_pos={TUNE['mlp_min_pos']})"
+)
 
 # ===== Cell 15 =====
 # Vectorized MLP probe inference using batched PyTorch matrix multiplies.
@@ -1843,8 +1867,9 @@ print("[OK] Vectorized MLP probe inference defined")
 # apply_per_class_thresholds sharpens probabilities around those thresholds.
 from sklearn.isotonic import IsotonicRegression
 
-def calibrate_and_optimize_thresholds(oof_probs, Y_FULL, 
-                                       threshold_grid=None, n_windows=12):
+def calibrate_and_optimize_thresholds(oof_probs, Y_FULL,
+                                       threshold_grid=None, n_windows=12,
+                                       min_pos_files=3, default_threshold=0.5):
     """
     CHANGE 2: For each species:
     1. Fit isotonic regression on OOF scores (calibrates overconfident/underconfident classes)
@@ -1855,7 +1880,7 @@ def calibrate_and_optimize_thresholds(oof_probs, Y_FULL,
         threshold_grid = [0.25, 0.30, 0.35, 0.40, 0.45, 0.50, 0.55, 0.60, 0.65, 0.70]
     
     n_samples, n_cls = oof_probs.shape
-    thresholds = np.full(n_cls, 0.5, dtype=np.float32)
+    thresholds = np.full(n_cls, float(default_threshold), dtype=np.float32)
     n_files    = n_samples // n_windows
     file_oof   = oof_probs.reshape(n_files, n_windows, n_cls).max(axis=1)
     file_y     = Y_FULL.reshape(n_files, n_windows, n_cls).max(axis=1)
@@ -1864,7 +1889,7 @@ def calibrate_and_optimize_thresholds(oof_probs, Y_FULL,
     for c in range(n_cls):
         y_true = file_y[:, c]
         y_prob = file_oof[:, c]
-        if y_true.sum() < 3:
+        if y_true.sum() < min_pos_files:
             continue
         try:
             ir = IsotonicRegression(out_of_bounds="clip")
@@ -3001,6 +3026,8 @@ else:
         Y_FULL=Y_FULL_aligned,
         threshold_grid=TUNE["threshold_grid"],
         n_windows=N_WINDOWS,
+        min_pos_files=TUNE["calib_min_pos_files"],
+        default_threshold=TUNE["calib_default_threshold"],
     )
 
     t0 = time.time()
