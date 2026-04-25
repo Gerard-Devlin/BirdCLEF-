@@ -324,6 +324,7 @@ STACKING_ENABLE = _env_bool("BC26_STACKING_ENABLE", False)
 STACKING_MIN_POS = _env_int("BC26_STACKING_MIN_POS", 6)
 STACKING_LOGREG_C = _env_float("BC26_STACKING_LOGREG_C", 1.0)
 BAGGING_FOLDS = _env_int("BC26_BAGGING_FOLDS", 1)
+RESIDUAL_USE_OOF_FIRST_PASS = _env_bool("BC26_RESIDUAL_USE_OOF_FIRST_PASS", False)
 
 np.random.seed(GLOBAL_SEED)
 random.seed(GLOBAL_SEED)
@@ -401,6 +402,8 @@ if STACKING_ENABLE:
     )
 if BAGGING_FOLDS > 1:
     print(f"TUNE: fold bagging enabled via BC26_BAGGING_FOLDS={BAGGING_FOLDS}")
+if RESIDUAL_USE_OOF_FIRST_PASS:
+    print("TUNE: residual training uses OOF first-pass logits via BC26_RESIDUAL_USE_OOF_FIRST_PASS=1")
 if TUNE["calib_bucketed"]:
     print(
         "TUNE: bucketed calibration enabled "
@@ -3535,12 +3538,13 @@ else:
         )
     )
     if (
-        BAGGING_FOLDS > 1
+        RESIDUAL_USE_OOF_FIRST_PASS
+        and BAGGING_FOLDS > 1
         and oof_first_pass_logits is not None
         and oof_first_pass_logits.shape == first_pass_tr.shape
     ):
         first_pass_tr = oof_first_pass_logits.astype(np.float32, copy=False)
-        print("[INFO] Using OOF bagged first-pass logits for calibration/residual training")
+        print("[INFO] Using OOF bagged first-pass logits for residual training")
 
     train_probs_for_calib = sigmoid(first_pass_tr)
     calib_probs = train_probs_for_calib
