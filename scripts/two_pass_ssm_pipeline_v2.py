@@ -263,6 +263,7 @@ TUNE = {
         [0.30, 0.35, 0.40, 0.45, 0.50, 0.55, 0.60, 0.65, 0.70],
     ),
     "calib_bucketed": _env_bool("BC26_CALIB_BUCKETED", False),
+    "calib_use_oof": _env_bool("BC26_CALIB_USE_OOF", True),
     "calib_rare_pos_max": _env_int("BC26_CALIB_RARE_POS_MAX", 5),
     "calib_common_pos_min": _env_int("BC26_CALIB_COMMON_POS_MIN", 20),
     "post_topk": _env_int("BC26_POST_TOPK", 2),
@@ -317,6 +318,8 @@ ENSEMBLE_W_GRID = _env_float_list(
 )
 ENSEMBLE_PER_CLASS = _env_bool("BC26_ENSEMBLE_PER_CLASS", False)
 ENSEMBLE_PER_FOLD = _env_bool("BC26_ENSEMBLE_PER_FOLD", False)
+ENSEMBLE_PER_CLASS_MIN_POS = _env_int("BC26_ENSEMBLE_PER_CLASS_MIN_POS", 6)
+ENSEMBLE_PER_CLASS_SHRINK = _env_float("BC26_ENSEMBLE_PER_CLASS_SHRINK", 0.5)
 
 np.random.seed(GLOBAL_SEED)
 random.seed(GLOBAL_SEED)
@@ -392,6 +395,8 @@ if TUNE["calib_bucketed"]:
         "TUNE: bucketed calibration enabled "
         f"(rare<= {TUNE['calib_rare_pos_max']}, common>= {TUNE['calib_common_pos_min']})"
     )
+if TUNE["calib_use_oof"]:
+    print("TUNE: calibration uses OOF probs when available via BC26_CALIB_USE_OOF=1")
 if DISABLE_EARLY_STOP:
     print("TUNE: early stopping disabled via BC26_DISABLE_EARLY_STOP=1")
 if DISABLE_GENUS_PROXY:
@@ -1606,7 +1611,7 @@ def _auto_tune_ensemble_weight_per_class(proto_logits, mlp_logits, y_true, defau
         yc = y_true[:, c].astype(np.int32)
         pos = int(yc.sum())
         neg = int(len(yc) - pos)
-        if pos < 3 or neg < 3:
+        if pos < int(ENSEMBLE_PER_CLASS_MIN_POS) or neg < int(ENSEMBLE_PER_CLASS_MIN_POS):
             continue
         p = proto_logits[:, c]
         m = mlp_logits[:, c]
@@ -1622,11 +1627,13 @@ def _auto_tune_ensemble_weight_per_class(proto_logits, mlp_logits, y_true, defau
             if auc > best_auc + 1e-12:
                 best_auc = float(auc)
                 best_w = float(w)
-        out[c] = best_w
+        shrink = float(np.clip(ENSEMBLE_PER_CLASS_SHRINK, 0.0, 1.0))
+        out[c] = np.float32(shrink * best_w + (1.0 - shrink) * float(default_w))
         tuned += 1
     print(
         f"[INFO] Per-class ensemble weight tuned for {tuned}/{n_classes} classes "
-        f"| mean={float(out.mean()):.4f} min={float(out.min()):.4f} max={float(out.max()):.4f}"
+        f"| mean={float(out.mean()):.4f} min={float(out.min()):.4f} max={float(out.max()):.4f} "
+        f"| min_pos>={int(ENSEMBLE_PER_CLASS_MIN_POS)} shrink={float(ENSEMBLE_PER_CLASS_SHRINK):.2f}"
     )
     return out
 
@@ -3041,6 +3048,7 @@ def run_pipeline_oof(emb_full, sc_full, Y_full, meta_full, n_splits=5):
     return overall, oof_probs
 
 
+pipeline_auc, oof_pipeline = None, None
 if CFG["run_oof"]:
     pipeline_auc, oof_pipeline = run_pipeline_oof(
         emb_tr,
@@ -3312,8 +3320,18 @@ else:
     )
 
     train_probs_for_calib = sigmoid(first_pass_tr)
+    calib_probs = train_probs_for_calib
+    if (
+        TUNE["calib_use_oof"]
+        and oof_pipeline is not None
+        and oof_pipeline.shape == train_probs_for_calib.shape
+    ):
+        calib_probs = oof_pipeline.astype(np.float32, copy=False)
+        print("[INFO] Calibration source: OOF pipeline probabilities")
+    else:
+        print("[INFO] Calibration source: in-sample train probabilities")
     PER_CLASS_THRESHOLDS = calibrate_and_optimize_thresholds(
-        oof_probs=train_probs_for_calib,
+        oof_probs=calib_probs,
         Y_FULL=Y_FULL_aligned,
         threshold_grid=TUNE["threshold_grid"],
         n_windows=N_WINDOWS,
