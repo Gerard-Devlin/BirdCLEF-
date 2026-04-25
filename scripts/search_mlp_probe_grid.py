@@ -1,4 +1,5 @@
 import argparse
+import concurrent.futures as cf
 import csv
 import itertools
 import os
@@ -52,6 +53,7 @@ def main() -> None:
     p.add_argument("--python-bin", default=sys.executable, help="Python executable")
     p.add_argument("--pipeline-script", type=Path, default=Path("scripts/two_pass_ssm_pipeline_v2.py"))
     p.add_argument("--cuda-visible-devices", default="1")
+    p.add_argument("--max-workers", type=int, default=1, help="Parallel workers")
     p.add_argument("--mode", default="train", choices=["train", "submit"])
     p.add_argument("--metric-mode", default="raw", choices=["raw", "full"])
     p.add_argument(
@@ -171,6 +173,12 @@ def main() -> None:
         base_env["BC26_STOP_AFTER_RAW_OOF"] = "1"
     base_env.update(extra_env)
 
+    gpu_pool = [x.strip() for x in str(args.cuda_visible_devices).split(",") if x.strip() != ""]
+    if not gpu_pool:
+        gpu_pool = [""]
+    max_workers = max(1, int(args.max_workers))
+    print(f"[INFO] max_workers={max_workers} gpu_pool={gpu_pool}")
+
     header = [
         "run_tag",
         "hidden1",
@@ -186,102 +194,139 @@ def main() -> None:
         "metric_value",
         "status",
         "elapsed_sec",
+        "gpu",
         "log_path",
         "ckpt_path",
     ]
     rows: list[dict[str, str | int | float]] = []
 
-    for idx, (h1, h2, mx, nit, a, lr, blend, pheads, aw) in enumerate(combos, start=1):
+    def _build_spec(idx: int, combo: tuple) -> dict:
+        h1, h2, mx, nit, a, lr, blend, pheads, aw = combo
         run_tag = (
             f"{args.run_tag_prefix}_{idx:03d}_h{h1}-{h2}_it{mx}_n{nit}_"
             f"a{a:g}_lr{lr:g}_b{blend:g}_ph{pheads}_aw{aw:g}"
         )
-        log_path = logs_dir / f"train_ckpt_{run_tag}.log"
-        ckpt_path = ckpt_dir / f"two_pass_pipeline_ckpt_{run_tag}.pth"
-        sub_path = root / "work" / f"submission_local_{run_tag}.csv"
+        return {
+            "idx": idx,
+            "h1": h1,
+            "h2": h2,
+            "mx": mx,
+            "nit": nit,
+            "a": a,
+            "lr": lr,
+            "blend": blend,
+            "pheads": pheads,
+            "aw": aw,
+            "run_tag": run_tag,
+            "log_path": logs_dir / f"train_ckpt_{run_tag}.log",
+            "ckpt_path": ckpt_dir / f"two_pass_pipeline_ckpt_{run_tag}.pth",
+            "sub_path": root / "work" / f"submission_local_{run_tag}.csv",
+            "gpu": gpu_pool[(idx - 1) % len(gpu_pool)],
+        }
 
-        env = base_env.copy()
-        env.update(
-            {
-                "BC26_CKPT_PATH": str(ckpt_path),
-                "BC26_SUBMISSION_PATH": str(sub_path),
-                "BC26_MLP_PROBE_HIDDEN1": str(h1),
-                "BC26_MLP_PROBE_HIDDEN2": str(h2),
-                "BC26_MLP_PROBE_MAX_ITER": str(mx),
-                "BC26_MLP_PROBE_N_ITER_NO_CHANGE": str(nit),
-                "BC26_MLP_PROBE_ALPHA": f"{a}",
-                "BC26_MLP_PROBE_LR_INIT": f"{lr}",
-                "BC26_MLP_ALPHA_BLEND": f"{blend}",
-                "BC26_PROTO_CROSS_ATTN_HEADS": str(pheads),
-                "BC26_PERCH_ADAPTER_WEIGHT": f"{aw}",
-            }
-        )
+    specs = [_build_spec(i, c) for i, c in enumerate(combos, start=1)]
 
-        print(f"\n[RUN {idx}/{len(combos)}] {run_tag}")
+    for spec in specs:
         print(
-            "  "
-            f"h=({h1},{h2}) max_iter={mx} n_iter_no_change={nit} "
-            f"alpha={a} lr={lr} blend={blend} proto_heads={pheads} adapter_weight={aw}"
+            f"[PLAN {spec['idx']}/{len(specs)}] {spec['run_tag']} "
+            f"gpu={spec['gpu']} h=({spec['h1']},{spec['h2']}) "
+            f"iter={spec['mx']} niter_no_change={spec['nit']} "
+            f"alpha={spec['a']} lr={spec['lr']} blend={spec['blend']} "
+            f"proto_heads={spec['pheads']} adapter_weight={spec['aw']}"
         )
 
-        if args.dry_run:
+    if args.dry_run:
+        for spec in specs:
             rows.append(
                 {
-                    "run_tag": run_tag,
-                    "hidden1": h1,
-                    "hidden2": h2,
-                    "max_iter": mx,
-                    "n_iter_no_change": nit,
-                    "alpha": a,
-                    "lr_init": lr,
-                    "blend": blend,
-                    "proto_cross_attn_heads": pheads,
-                    "adapter_weight": aw,
+                    "run_tag": spec["run_tag"],
+                    "hidden1": spec["h1"],
+                    "hidden2": spec["h2"],
+                    "max_iter": spec["mx"],
+                    "n_iter_no_change": spec["nit"],
+                    "alpha": spec["a"],
+                    "lr_init": spec["lr"],
+                    "blend": spec["blend"],
+                    "proto_cross_attn_heads": spec["pheads"],
+                    "adapter_weight": spec["aw"],
                     "metric": args.metric_mode,
                     "metric_value": "",
                     "status": "DRY_RUN",
                     "elapsed_sec": 0.0,
-                    "log_path": str(log_path),
-                    "ckpt_path": str(ckpt_path),
+                    "gpu": spec["gpu"],
+                    "log_path": str(spec["log_path"]),
+                    "ckpt_path": str(spec["ckpt_path"]),
                 }
             )
-            continue
-
-        start = time.time()
-        with log_path.open("w", encoding="utf-8") as f:
-            proc = subprocess.run(
-                [args.python_bin, str(pipeline_script)],
-                cwd=str(root),
-                env=env,
-                stdout=f,
-                stderr=subprocess.STDOUT,
-                check=False,
+    else:
+        def _run_one(spec: dict) -> dict:
+            env = base_env.copy()
+            env.update(
+                {
+                    "CUDA_VISIBLE_DEVICES": str(spec["gpu"]),
+                    "BC26_CKPT_PATH": str(spec["ckpt_path"]),
+                    "BC26_SUBMISSION_PATH": str(spec["sub_path"]),
+                    "BC26_MLP_PROBE_HIDDEN1": str(spec["h1"]),
+                    "BC26_MLP_PROBE_HIDDEN2": str(spec["h2"]),
+                    "BC26_MLP_PROBE_MAX_ITER": str(spec["mx"]),
+                    "BC26_MLP_PROBE_N_ITER_NO_CHANGE": str(spec["nit"]),
+                    "BC26_MLP_PROBE_ALPHA": f"{spec['a']}",
+                    "BC26_MLP_PROBE_LR_INIT": f"{spec['lr']}",
+                    "BC26_MLP_ALPHA_BLEND": f"{spec['blend']}",
+                    "BC26_PROTO_CROSS_ATTN_HEADS": str(spec["pheads"]),
+                    "BC26_PERCH_ADAPTER_WEIGHT": f"{spec['aw']}",
+                }
             )
-        elapsed = time.time() - start
-        metric_val = extract_metric(log_path, args.metric_mode)
-        status = "OK" if proc.returncode == 0 else f"FAIL_{proc.returncode}"
+            start = time.time()
+            with Path(spec["log_path"]).open("w", encoding="utf-8") as f:
+                proc = subprocess.run(
+                    [args.python_bin, str(pipeline_script)],
+                    cwd=str(root),
+                    env=env,
+                    stdout=f,
+                    stderr=subprocess.STDOUT,
+                    check=False,
+                )
+            elapsed = time.time() - start
+            metric_val = extract_metric(Path(spec["log_path"]), args.metric_mode)
+            status = "OK" if proc.returncode == 0 else f"FAIL_{proc.returncode}"
+            return {
+                "run_tag": spec["run_tag"],
+                "hidden1": spec["h1"],
+                "hidden2": spec["h2"],
+                "max_iter": spec["mx"],
+                "n_iter_no_change": spec["nit"],
+                "alpha": spec["a"],
+                "lr_init": spec["lr"],
+                "blend": spec["blend"],
+                "proto_cross_attn_heads": spec["pheads"],
+                "adapter_weight": spec["aw"],
+                "metric": args.metric_mode,
+                "metric_value": "" if metric_val is None else metric_val,
+                "status": status,
+                "elapsed_sec": round(elapsed, 2),
+                "gpu": spec["gpu"],
+                "log_path": str(spec["log_path"]),
+                "ckpt_path": str(spec["ckpt_path"]),
+            }
 
-        row = {
-            "run_tag": run_tag,
-            "hidden1": h1,
-            "hidden2": h2,
-            "max_iter": mx,
-            "n_iter_no_change": nit,
-            "alpha": a,
-            "lr_init": lr,
-            "blend": blend,
-            "proto_cross_attn_heads": pheads,
-            "adapter_weight": aw,
-            "metric": args.metric_mode,
-            "metric_value": "" if metric_val is None else metric_val,
-            "status": status,
-            "elapsed_sec": round(elapsed, 2),
-            "log_path": str(log_path),
-            "ckpt_path": str(ckpt_path),
-        }
-        rows.append(row)
-        print(f"  status={status} {args.metric_mode}_auc={metric_val} elapsed={elapsed:.1f}s")
+        with cf.ThreadPoolExecutor(max_workers=max_workers) as ex:
+            future_map = {ex.submit(_run_one, spec): spec for spec in specs}
+            for fut in cf.as_completed(future_map):
+                row = fut.result()
+                rows.append(row)
+                print(
+                    f"[DONE] {row['run_tag']} gpu={row['gpu']} "
+                    f"status={row['status']} {args.metric_mode}_auc={row['metric_value']} "
+                    f"elapsed={row['elapsed_sec']}s"
+                )
+                with results_csv.open("w", encoding="utf-8", newline="") as wf:
+                    writer = csv.DictWriter(wf, fieldnames=header)
+                    writer.writeheader()
+                    for r in rows:
+                        writer.writerow(r)
 
+    if rows:
         with results_csv.open("w", encoding="utf-8", newline="") as wf:
             writer = csv.DictWriter(wf, fieldnames=header)
             writer.writeheader()
