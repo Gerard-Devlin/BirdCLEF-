@@ -248,7 +248,7 @@ TUNE = {
     "calib_min_pos_files": _env_int("BC26_CALIB_MIN_POS_FILES", 3),
     "calib_default_threshold": _env_float("BC26_CALIB_DEFAULT_THRESHOLD", 0.5),
     "prior_lambda": _env_float("BC26_PRIOR_LAMBDA", 0.4),
-    "ensemble_w": _env_float("BC26_ENSEMBLE_W", 0.5),
+    "ensemble_w": 0.5,
     "tta_shifts": _env_int_list("BC26_TTA_SHIFTS", [0, 1, -1, 2, -2]),
     "threshold_grid": _env_float_list(
         "BC26_THRESHOLD_GRID",
@@ -272,6 +272,13 @@ PERCH_ADAPTER_WEIGHT_GRID = _env_float_list(
     "BC26_PERCH_ADAPTER_WEIGHT_GRID",
     [0.0, 0.05, 0.08, 0.10, 0.12, 0.15, 0.18, 0.20, 0.22, 0.25, 0.30],
 )
+PERCH_ADAPTER_PER_CLASS_WEIGHT_RAW = os.environ.get("BC26_PERCH_ADAPTER_PER_CLASS_WEIGHT", "").strip()
+PERCH_ADAPTER_PER_CLASS_WEIGHT_AUTO = PERCH_ADAPTER_PER_CLASS_WEIGHT_RAW.lower() in {"auto", "cv", "soundscape"}
+PERCH_ADAPTER_PER_CLASS_WEIGHT_GRID = _env_float_list(
+    "BC26_PERCH_ADAPTER_PER_CLASS_WEIGHT_GRID",
+    [0.0, 0.05, 0.08, 0.10, 0.12, 0.15, 0.18, 0.20, 0.22, 0.25, 0.30],
+)
+PERCH_ADAPTER_PER_CLASS_WEIGHT = None
 PERCH_ADAPTER_MODEL = None
 PERCH_EMB_CLS_CKPT_RAW = os.environ.get("BC26_PERCH_EMB_CLS_CKPT", "").strip()
 PERCH_EMB_CLS_WEIGHT = _env_float("BC26_PERCH_EMB_CLS_WEIGHT", 0.35)
@@ -288,6 +295,15 @@ PERCH_MIL_CLS_MODEL = None
 UNMAPPED_HEAD_CKPT_RAW = os.environ.get("BC26_UNMAPPED_HEAD_CKPT", "").strip()
 UNMAPPED_HEAD_WEIGHT = _env_float("BC26_UNMAPPED_HEAD_WEIGHT", 0.35)
 UNMAPPED_HEAD_MODEL = None
+
+ENSEMBLE_W_RAW = os.environ.get("BC26_ENSEMBLE_W", "").strip()
+ENSEMBLE_W_AUTO = ENSEMBLE_W_RAW.lower() in {"auto", "cv", "soundscape"}
+if not ENSEMBLE_W_AUTO and ENSEMBLE_W_RAW != "":
+    TUNE["ensemble_w"] = float(ENSEMBLE_W_RAW)
+ENSEMBLE_W_GRID = _env_float_list(
+    "BC26_ENSEMBLE_W_GRID",
+    [0.20, 0.30, 0.40, 0.50, 0.60, 0.70, 0.80],
+)
 
 np.random.seed(GLOBAL_SEED)
 random.seed(GLOBAL_SEED)
@@ -309,6 +325,12 @@ if PERCH_ADAPTER_CKPT_RAW:
         f"  perch_adapter_ckpt={PERCH_ADAPTER_CKPT_RAW} "
         f"(weight={weight_msg})"
     )
+    if PERCH_ADAPTER_PER_CLASS_WEIGHT_AUTO:
+        print(
+            "  perch_adapter_per_class_weight=auto["
+            + ",".join(str(float(x)) for x in PERCH_ADAPTER_PER_CLASS_WEIGHT_GRID)
+            + "]"
+        )
 if PERCH_EMB_CLS_CKPT_RAW:
     print(
         f"  perch_emb_cls_ckpt={PERCH_EMB_CLS_CKPT_RAW} "
@@ -342,6 +364,7 @@ print(
     f"(d_model={TUNE['proto_d_model']},d_state={TUNE['proto_d_state']},layers={TUNE['proto_n_layers']},heads={TUNE['proto_cross_attn_heads']}) "
     f"res={TUNE['res_epochs']}ep/{TUNE['res_patience']}pat@{TUNE['res_lr']} "
     f"(d_model={TUNE['res_d_model']},d_state={TUNE['res_d_state']}) "
+    f"ens_w={'auto' if ENSEMBLE_W_AUTO else TUNE['ensemble_w']} "
     f"mlp(min_pos={TUNE['mlp_min_pos']},pca={TUNE['mlp_pca_dim']},alpha={TUNE['mlp_alpha_blend']},"
     f"hidden=({TUNE['mlp_probe_hidden1']},{TUNE['mlp_probe_hidden2']}),max_iter={TUNE['mlp_probe_max_iter']}) "
     f"calib(min_pos_files={TUNE['calib_min_pos_files']},default_t={TUNE['calib_default_threshold']}) "
@@ -1441,10 +1464,24 @@ def _load_perch_adapter_from_env():
     return model
 
 
-def _apply_perch_adapter(scores_raw, emb_raw, adapter_model, weight=1.0, batch_size=2048):
+def _apply_perch_adapter(
+    scores_raw,
+    emb_raw,
+    adapter_model,
+    weight=1.0,
+    per_class_weight=None,
+    batch_size=2048,
+):
     if adapter_model is None or abs(weight) < 1e-12:
         return scores_raw
     delta = _predict_perch_adapter_delta(scores_raw, emb_raw, adapter_model, batch_size=batch_size)
+    if per_class_weight is not None:
+        w = np.asarray(per_class_weight, dtype=np.float32)
+        if w.shape[0] != delta.shape[1]:
+            raise RuntimeError(
+                f"Per-class adapter weight dim {w.shape[0]} does not match n_classes {delta.shape[1]}."
+            )
+        delta = delta * w[None, :]
     return scores_raw + float(weight) * delta
 
 
@@ -1483,6 +1520,59 @@ def _auto_tune_perch_adapter_weight(scores_raw, emb_raw, y_true, adapter_model):
             best_w = float(w)
     print("[INFO] Adapter weight soundscape search: " + " ".join(rows))
     print(f"[INFO] Adapter weight selected on train_soundscapes: {best_w:.4g} (auc={best_auc:.6f})")
+    return best_w
+
+
+def _auto_tune_perch_adapter_per_class_weight(scores_raw, emb_raw, y_true, adapter_model):
+    if adapter_model is None:
+        return None
+    delta = _predict_perch_adapter_delta(scores_raw, emb_raw, adapter_model)
+    n_classes = scores_raw.shape[1]
+    out = np.ones(n_classes, dtype=np.float32)
+    searched = 0
+    for c in range(n_classes):
+        yc = y_true[:, c].astype(np.int32)
+        pos = int(yc.sum())
+        neg = int(len(yc) - pos)
+        if pos < 3 or neg < 3:
+            continue
+        base = scores_raw[:, c]
+        d = delta[:, c]
+        best_w = 1.0
+        best_auc = -1.0
+        for w in PERCH_ADAPTER_PER_CLASS_WEIGHT_GRID:
+            logits = base + float(w) * d
+            probs = 1.0 / (1.0 + np.exp(-np.clip(logits, -30, 30)))
+            try:
+                auc = roc_auc_score(yc, probs)
+            except Exception:
+                continue
+            if auc > best_auc + 1e-12:
+                best_auc = float(auc)
+                best_w = float(w)
+        out[c] = best_w
+        searched += 1
+    print(
+        f"[INFO] Per-class adapter weight tuned for {searched}/{n_classes} classes "
+        f"| mean={float(out.mean()):.4f} min={float(out.min()):.4f} max={float(out.max()):.4f}"
+    )
+    return out
+
+
+def _auto_tune_ensemble_weight(proto_logits, mlp_logits, y_true):
+    best_w = float(ENSEMBLE_W_GRID[0])
+    best_auc = -1.0
+    rows = []
+    for w in ENSEMBLE_W_GRID:
+        logits = float(w) * proto_logits + (1.0 - float(w)) * mlp_logits
+        probs = 1.0 / (1.0 + np.exp(-np.clip(logits, -30, 30)))
+        auc = macro_auc(y_true, probs)
+        rows.append(f"{float(w):.3g}:{auc:.6f}")
+        if auc > best_auc + 1e-12:
+            best_auc = float(auc)
+            best_w = float(w)
+    print("[INFO] Ensemble weight search: " + " ".join(rows))
+    print(f"[INFO] Ensemble weight selected: {best_w:.4g} (auc={best_auc:.6f})")
     return best_w
 
 
@@ -1714,11 +1804,24 @@ if PERCH_ADAPTER_MODEL is not None and "sc_tr" in globals() and "emb_tr" in glob
             "[WARN] BC26_PERCH_ADAPTER_WEIGHT=auto requires train labels; "
             f"using default weight={PERCH_ADAPTER_WEIGHT} in {MODE} mode."
         )
+    if PERCH_ADAPTER_PER_CLASS_WEIGHT_AUTO and MODE == "train":
+        PERCH_ADAPTER_PER_CLASS_WEIGHT = _auto_tune_perch_adapter_per_class_weight(
+            sc_tr,
+            emb_tr,
+            Y_FULL_aligned,
+            PERCH_ADAPTER_MODEL,
+        )
+    elif PERCH_ADAPTER_PER_CLASS_WEIGHT_AUTO:
+        print(
+            "[WARN] BC26_PERCH_ADAPTER_PER_CLASS_WEIGHT=auto requires train labels; "
+            f"skip in {MODE} mode."
+        )
     sc_tr = _apply_perch_adapter(
         sc_tr,
         emb_tr,
         PERCH_ADAPTER_MODEL,
         weight=PERCH_ADAPTER_WEIGHT,
+        per_class_weight=PERCH_ADAPTER_PER_CLASS_WEIGHT,
     )
     print(
         f"[OK] Applied Perch adapter to training cache in {time.time()-t0:.1f}s "
@@ -2816,6 +2919,7 @@ if PERCH_ADAPTER_MODEL is not None:
         emb_te,
         PERCH_ADAPTER_MODEL,
         weight=PERCH_ADAPTER_WEIGHT,
+        per_class_weight=PERCH_ADAPTER_PER_CLASS_WEIGHT,
     )
     print(
         f"[OK] Applied Perch adapter to test scores in {time.time()-t0:.1f}s "
@@ -2916,6 +3020,9 @@ if LOAD_FROM_CKPT:
     alpha_blend = float(ckpt.get("alpha_blend", TUNE["mlp_alpha_blend"]))
     ENSEMBLE_W = float(ckpt.get("ensemble_w", TUNE["ensemble_w"]))
     correction_weight = float(ckpt.get("correction_weight", TUNE["res_correction_weight"]))
+    _pcw = ckpt.get("perch_adapter_per_class_weight")
+    if _pcw is not None:
+        PERCH_ADAPTER_PER_CLASS_WEIGHT = np.asarray(_pcw, dtype=np.float32)
     temperatures = np.asarray(ckpt["temperatures"], dtype=np.float32)
     PER_CLASS_THRESHOLDS = np.asarray(ckpt["per_class_thresholds"], dtype=np.float32)
     n_sites_cap = int(ckpt.get("n_sites_cap", 20))
@@ -3023,6 +3130,12 @@ else:
         emb_tr, sc_tr_prior,
         probe_models, emb_scaler, emb_pca, alpha_blend,
     )
+    if ENSEMBLE_W_AUTO:
+        ENSEMBLE_W = _auto_tune_ensemble_weight(
+            proto_tr_flat,
+            sc_tr_mlp,
+            Y_FULL_aligned,
+        )
     first_pass_tr = (ENSEMBLE_W * proto_tr_flat
                      + (1.0 - ENSEMBLE_W) * sc_tr_mlp)
 
@@ -3091,6 +3204,11 @@ else:
                 "tune": dict(TUNE),
                 "perch_adapter_ckpt": PERCH_ADAPTER_CKPT_RAW,
                 "perch_adapter_weight": float(PERCH_ADAPTER_WEIGHT),
+                "perch_adapter_per_class_weight": (
+                    PERCH_ADAPTER_PER_CLASS_WEIGHT.astype(np.float32)
+                    if PERCH_ADAPTER_PER_CLASS_WEIGHT is not None
+                    else None
+                ),
                 "perch_mil_cls_ckpt": PERCH_MIL_CLS_CKPT_RAW,
                 "perch_mil_cls_weight": float(PERCH_MIL_CLS_WEIGHT),
             },
