@@ -174,13 +174,15 @@ def make_targets(df: pd.DataFrame, label_set: set[str], include_secondary: bool)
 
 def build_file_table(train_df: pd.DataFrame, audio_dir: Path, label_to_idx: dict[str, int]) -> list[dict]:
     rows = []
-    for r in train_df.itertuples(index=False):
-        rel = str(getattr(r, "filename", "")).strip()
+    filenames = train_df["filename"].astype(str).tolist()
+    labels_col = train_df["__labels"].tolist()
+    for rel, labels in zip(filenames, labels_col):
+        rel = str(rel).strip()
         path = audio_dir / rel
         if not path.exists():
             continue
         y = np.zeros(len(label_to_idx), dtype=np.float32)
-        for lbl in getattr(r, "__labels"):
+        for lbl in labels:
             y[label_to_idx[lbl]] = 1.0
         rows.append({"path": path, "y": y})
     return rows
@@ -395,4 +397,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
