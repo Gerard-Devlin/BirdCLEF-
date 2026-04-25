@@ -263,6 +263,7 @@ TUNE = {
 DISABLE_EARLY_STOP = _env_bool("BC26_DISABLE_EARLY_STOP", False)
 GLOBAL_SEED = _env_int("BC26_SEED", 42)
 DISABLE_GENUS_PROXY = _env_bool("BC26_DISABLE_GENUS_PROXY", False)
+STOP_AFTER_RAW_OOF = _env_bool("BC26_STOP_AFTER_RAW_OOF", False)
 PERCH_ADAPTER_CKPT_RAW = os.environ.get("BC26_PERCH_ADAPTER_CKPT", "").strip()
 PERCH_ADAPTER_WEIGHT_RAW = os.environ.get("BC26_PERCH_ADAPTER_WEIGHT", "1.0").strip()
 PERCH_ADAPTER_WEIGHT_AUTO = PERCH_ADAPTER_WEIGHT_RAW.lower() in {"auto", "cv", "soundscape"}
@@ -350,6 +351,8 @@ if DISABLE_EARLY_STOP:
     print("TUNE: early stopping disabled via BC26_DISABLE_EARLY_STOP=1")
 if DISABLE_GENUS_PROXY:
     print("TUNE: genus proxy disabled via BC26_DISABLE_GENUS_PROXY=1")
+if STOP_AFTER_RAW_OOF:
+    print("TUNE: stop after raw OOF via BC26_STOP_AFTER_RAW_OOF=1")
 
 # ===== Cell 4 =====
 # Load competition CSVs and derive per-window label arrays.
@@ -2639,6 +2642,9 @@ if CFG["run_oof"]:
         label="raw Perch"
     )
     print(f"\nBaseline OOF AUC: {baseline_auc:.6f}  ->your starting point")
+    if STOP_AFTER_RAW_OOF:
+        print("[INFO] Exiting early after raw OOF as requested.")
+        raise SystemExit(0)
 else:
     print("Submit mode: skipping OOF evaluation")
 
