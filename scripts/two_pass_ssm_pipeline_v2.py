@@ -847,6 +847,10 @@ if missing_rows:
     )
 
 Y_FULL_aligned = Y_SC[row_id_to_index.loc[meta_tr["row_id"]].to_numpy()]
+ACTIVE_CLASS_MASK = (Y_FULL_aligned.sum(axis=0) > 0)
+INACTIVE_CLASS_MASK = ~ACTIVE_CLASS_MASK
+ACTIVE_CLASS_IDX = np.where(ACTIVE_CLASS_MASK)[0]
+INACTIVE_CLASS_IDX = np.where(INACTIVE_CLASS_MASK)[0]
 
 expected_rows = len(full_files) * N_WINDOWS
 if len(meta_tr) != expected_rows:
@@ -855,6 +859,10 @@ if len(meta_tr) != expected_rows:
 
 print(f"sc_tr: {sc_tr.shape}  emb_tr: {emb_tr.shape}  "
       f"Y_FULL_aligned: {Y_FULL_aligned.shape}")
+print(
+    f"[INFO] Dual-track classes: active={int(ACTIVE_CLASS_MASK.sum())} "
+    f"inactive={int(INACTIVE_CLASS_MASK.sum())}"
+)
 
 if PERCH_ADAPTER_MODEL is not None:
     t0 = time.time()
@@ -880,6 +888,30 @@ def macro_auc(y_true, y_score):
     """
     keep = y_true.sum(axis=0) > 0
     return roc_auc_score(y_true[:, keep], y_score[:, keep], average="macro")
+
+
+def macro_auc_fixed_classes(y_true, y_score, class_mask, missing_score=0.5):
+    idx = np.where(class_mask)[0]
+    per_cls = []
+    for c in idx:
+        yt = y_true[:, c]
+        ys = y_score[:, c]
+        if yt.min() == yt.max():
+            per_cls.append(float(missing_score))
+            continue
+        try:
+            per_cls.append(float(roc_auc_score(yt, ys)))
+        except Exception:
+            per_cls.append(float(missing_score))
+    if not per_cls:
+        return float(missing_score)
+    return float(np.mean(per_cls))
+
+
+def merge_active_with_base(active_logits, base_logits, active_mask):
+    out = np.array(base_logits, copy=True)
+    out[:, active_mask] = active_logits[:, active_mask]
+    return out.astype(np.float32, copy=False)
  
  
 def honest_oof_auc(scores, Y, meta_df, n_splits=5, label="scores"):
@@ -2130,7 +2162,8 @@ def calibrate_and_optimize_thresholds(oof_probs, Y_FULL,
                                        rare_pos_max=5,
                                        common_pos_min=20,
                                        threshold_grid_rare=None,
-                                       threshold_grid_common=None):
+                                       threshold_grid_common=None,
+                                       active_mask=None):
     """
     CHANGE 2: For each species:
     1. Fit isotonic regression on OOF scores (calibrates overconfident/underconfident classes)
@@ -2148,6 +2181,9 @@ def calibrate_and_optimize_thresholds(oof_probs, Y_FULL,
     
     n_calibrated = 0
     for c in range(n_cls):
+        if active_mask is not None and not bool(active_mask[c]):
+            thresholds[c] = float(default_threshold)
+            continue
         y_true = file_y[:, c]
         y_prob = file_oof[:, c]
         if y_true.sum() < min_pos_files:
@@ -2791,6 +2827,7 @@ def train_residual_ssm(emb_full, first_pass_flat, Y_full,
                        n_epochs=30, patience=8, lr=1e-3,
                        d_model=64, d_state=8, meta_dim=8, dropout=0.1,
                        correction_weight=0.30,
+                       active_mask=None,
                        verbose=False):
     """
     Train ResidualSSM to predict (Y - sigmoid(first_pass)).
@@ -2819,6 +2856,14 @@ def train_residual_ssm(emb_full, first_pass_flat, Y_full,
     res_t    = torch.tensor(residuals, dtype=torch.float32, device=TORCH_DEVICE)
     site_t   = torch.tensor(site_ids, dtype=torch.long, device=TORCH_DEVICE)
     hour_t   = torch.tensor(hour_ids, dtype=torch.long, device=TORCH_DEVICE)
+    if active_mask is None:
+        class_mask_t = torch.ones((1, 1, N_CLASSES), dtype=torch.float32, device=TORCH_DEVICE)
+    else:
+        class_mask_t = torch.tensor(
+            active_mask.astype(np.float32)[None, None, :],
+            dtype=torch.float32,
+            device=TORCH_DEVICE,
+        )
 
     model = ResidualSSM(
         n_classes=N_CLASSES,
@@ -2850,7 +2895,8 @@ def train_residual_ssm(emb_full, first_pass_flat, Y_full,
         corr = model(emb_t[train_i], fp_t[train_i],
                      site_ids=site_t[train_i],
                      hours   =hour_t[train_i])
-        loss = F.mse_loss(corr, res_t[train_i])
+        diff = (corr - res_t[train_i]) * class_mask_t
+        loss = (diff * diff).sum() / (class_mask_t.sum() * corr.shape[0] * corr.shape[1] + 1e-8)
         opt.zero_grad(); loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         opt.step(); sched.step()
@@ -2860,7 +2906,8 @@ def train_residual_ssm(emb_full, first_pass_flat, Y_full,
             val_corr = model(emb_t[val_i], fp_t[val_i],
                              site_ids=site_t[val_i],
                              hours   =hour_t[val_i])
-            val_loss = F.mse_loss(val_corr, res_t[val_i])
+            vdiff = (val_corr - res_t[val_i]) * class_mask_t
+            val_loss = (vdiff * vdiff).sum() / (class_mask_t.sum() * val_corr.shape[0] * val_corr.shape[1] + 1e-8)
 
         if val_loss.item() < best_loss:
             best_loss  = val_loss.item()
@@ -2908,6 +2955,7 @@ def train_residual_ssm_kfold(
     meta_dim=8,
     dropout=0.1,
     correction_weight=0.30,
+    active_mask=None,
     verbose=False,
 ):
     """Train residual models on GroupKFold splits and return CPU state dicts."""
@@ -2927,6 +2975,7 @@ def train_residual_ssm_kfold(
             meta_dim=meta_dim,
             dropout=dropout,
             correction_weight=correction_weight,
+            active_mask=active_mask,
             verbose=verbose,
         )
         state = {k: v.detach().cpu() for k, v in model.state_dict().items()}
@@ -2949,6 +2998,14 @@ def train_residual_ssm_kfold(
     res_t = torch.tensor(residuals, dtype=torch.float32, device=TORCH_DEVICE)
     site_t = torch.tensor(site_ids, dtype=torch.long, device=TORCH_DEVICE)
     hour_t = torch.tensor(hour_ids, dtype=torch.long, device=TORCH_DEVICE)
+    if active_mask is None:
+        class_mask_t = torch.ones((1, 1, N_CLASSES), dtype=torch.float32, device=TORCH_DEVICE)
+    else:
+        class_mask_t = torch.tensor(
+            active_mask.astype(np.float32)[None, None, :],
+            dtype=torch.float32,
+            device=TORCH_DEVICE,
+        )
 
     print(
         f"ResidualSSM params: "
@@ -2996,7 +3053,8 @@ def train_residual_ssm_kfold(
                 site_ids=site_t[train_i],
                 hours=hour_t[train_i],
             )
-            loss = F.mse_loss(corr, res_t[train_i])
+            diff = (corr - res_t[train_i]) * class_mask_t
+            loss = (diff * diff).sum() / (class_mask_t.sum() * corr.shape[0] * corr.shape[1] + 1e-8)
             opt.zero_grad()
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -3011,7 +3069,8 @@ def train_residual_ssm_kfold(
                     site_ids=site_t[val_i],
                     hours=hour_t[val_i],
                 )
-                val_loss = F.mse_loss(val_corr, res_t[val_i])
+                vdiff = (val_corr - res_t[val_i]) * class_mask_t
+                val_loss = (vdiff * vdiff).sum() / (class_mask_t.sum() * val_corr.shape[0] * val_corr.shape[1] + 1e-8)
 
             if val_loss.item() < best_loss:
                 best_loss = val_loss.item()
@@ -3300,7 +3359,8 @@ def run_pipeline_oof(emb_full, sc_full, Y_full, meta_full, n_splits=5):
                     Y_tr_f,
                 )
 
-        first_pass = _blend_ensemble_logits(proto_va, sc_va_mlp, fold_weight)
+        first_pass_active = _blend_ensemble_logits(proto_va, sc_va_mlp, fold_weight)
+        first_pass = merge_active_with_base(first_pass_active, sc_va_f, ACTIVE_CLASS_MASK)
         oof_first_pass_logits[va_mask] = first_pass.astype(np.float32, copy=False)
         probs_va = 1.0 / (1.0 + np.exp(-np.clip(first_pass, -30, 30)))
         oof_probs[va_mask] = probs_va
@@ -3326,13 +3386,26 @@ def run_pipeline_oof(emb_full, sc_full, Y_full, meta_full, n_splits=5):
                 }
             )
 
-        fold_auc = macro_auc(Y_full[va_mask], probs_va)
+        fold_auc_local = macro_auc(Y_full[va_mask], probs_va)
+        fold_auc_active_global = macro_auc_fixed_classes(
+            Y_full[va_mask],
+            probs_va,
+            ACTIVE_CLASS_MASK,
+            missing_score=0.5,
+        )
         print(
-            f"  Fold {fold}/{n_splits}  val files={len(va_fnames)}  AUC={fold_auc:.6f}"
+            f"  Fold {fold}/{n_splits}  val files={len(va_fnames)}  "
+            f"AUC(local)={fold_auc_local:.6f}  AUC(active-global)={fold_auc_active_global:.6f}"
         )
 
     overall = macro_auc(Y_full, oof_probs)
-    print(f"\nFull pipeline OOF AUC: {overall:.6f}")
+    overall_active_global = macro_auc_fixed_classes(
+        Y_full, oof_probs, ACTIVE_CLASS_MASK, missing_score=0.5
+    )
+    print(
+        f"\nFull pipeline OOF AUC: {overall:.6f} "
+        f"(active-global={overall_active_global:.6f})"
+    )
     return (
         overall,
         oof_probs,
@@ -3498,7 +3571,7 @@ def _predict_test_first_pass_from_fold_artifacts(emb_te, sc_te, meta_te, artifac
             sc_te,
             sites=meta_te["site"].to_numpy(),
             hours=meta_te["hour_utc"].to_numpy(),
-            tables=art["prior_tables"],
+            tables=art.get("prior_tables", prior_tables),
             lambda_prior=TUNE["prior_lambda"],
         )
         mlp_flat = apply_mlp_probes_vectorized(
@@ -3737,6 +3810,7 @@ else:
             c_value=STACKING_LOGREG_C,
         )
         oof_stacked_logits = apply_logit_stacker(oof_proto_logits, oof_mlp_logits, STACKER)
+        oof_stacked_logits = merge_active_with_base(oof_stacked_logits, sc_tr, ACTIVE_CLASS_MASK)
         oof_pipeline = sigmoid(oof_stacked_logits)
         stack_auc = macro_auc(Y_FULL_aligned, oof_pipeline)
         print(f"[INFO] OOF stacker macro-AUC: {stack_auc:.6f}")
@@ -3759,6 +3833,7 @@ else:
     ):
         first_pass_tr = oof_first_pass_logits.astype(np.float32, copy=False)
         print("[INFO] Using OOF bagged first-pass logits for residual training")
+    first_pass_tr = merge_active_with_base(first_pass_tr, sc_tr, ACTIVE_CLASS_MASK)
 
     train_probs_for_calib = sigmoid(first_pass_tr)
     calib_probs = train_probs_for_calib
@@ -3783,6 +3858,7 @@ else:
         common_pos_min=TUNE["calib_common_pos_min"],
         threshold_grid_rare=TUNE["threshold_grid_rare"],
         threshold_grid_common=TUNE["threshold_grid_common"],
+        active_mask=ACTIVE_CLASS_MASK,
     )
 
     t0 = time.time()
@@ -3803,6 +3879,7 @@ else:
             meta_dim=TUNE["res_meta_dim"],
             dropout=TUNE["res_dropout"],
             correction_weight=TUNE["res_correction_weight"],
+            active_mask=ACTIVE_CLASS_MASK,
             verbose=False,
         )
         RES_MODELS = []
@@ -3834,6 +3911,7 @@ else:
             meta_dim=TUNE["res_meta_dim"],
             dropout=TUNE["res_dropout"],
             correction_weight=TUNE["res_correction_weight"],
+            active_mask=ACTIVE_CLASS_MASK,
             verbose=False,
         )
         RES_MODELS = [res_model]
@@ -3957,6 +4035,7 @@ else:
             ENSEMBLE_W_VEC if ENSEMBLE_W_VEC is not None else ENSEMBLE_W,
         )
     )
+first_pass_flat = merge_active_with_base(first_pass_flat, sc_te, ACTIVE_CLASS_MASK)
 
 first_pass_te_f  = first_pass_flat.reshape(n_test_files, N_WINDOWS, -1)
 test_correction = None
@@ -3980,6 +4059,7 @@ if len(RES_MODELS) > 1:
     print(f"[INFO] Residual bagging applied from {len(RES_MODELS)} models")
 
 correction_flat = test_correction.reshape(-1, N_CLASSES).astype(np.float32)
+correction_flat[:, INACTIVE_CLASS_MASK] = 0.0
 final_scores    = (first_pass_flat
                    + correction_weight * correction_flat)
 
