@@ -3124,7 +3124,7 @@ def run_pipeline_oof(emb_full, sc_full, Y_full, meta_full, n_splits=5):
         sc_va_f = sc_full[va_mask]
         meta_va_f = meta_full[va_mask].reset_index(drop=True)
 
-        prior_tables_fold = build_prior_tables(sc_tr_f, Y_tr_f)
+        prior_tables_fold = build_prior_tables(meta_tr_f, Y_tr_f)
         sc_tr_prior_fold = apply_prior(
             sc_tr_f,
             sites=meta_tr_f["site"].to_numpy(),
