@@ -325,6 +325,7 @@ STACKING_MIN_POS = _env_int("BC26_STACKING_MIN_POS", 6)
 STACKING_LOGREG_C = _env_float("BC26_STACKING_LOGREG_C", 1.0)
 BAGGING_FOLDS = _env_int("BC26_BAGGING_FOLDS", 1)
 RESIDUAL_USE_OOF_FIRST_PASS = _env_bool("BC26_RESIDUAL_USE_OOF_FIRST_PASS", False)
+RESIDUAL_BAGGING_FOLDS = _env_int("BC26_RESIDUAL_BAGGING_FOLDS", 1)
 
 np.random.seed(GLOBAL_SEED)
 random.seed(GLOBAL_SEED)
@@ -404,6 +405,8 @@ if BAGGING_FOLDS > 1:
     print(f"TUNE: fold bagging enabled via BC26_BAGGING_FOLDS={BAGGING_FOLDS}")
 if RESIDUAL_USE_OOF_FIRST_PASS:
     print("TUNE: residual training uses OOF first-pass logits via BC26_RESIDUAL_USE_OOF_FIRST_PASS=1")
+if RESIDUAL_BAGGING_FOLDS > 1:
+    print(f"TUNE: residual fold bagging enabled via BC26_RESIDUAL_BAGGING_FOLDS={RESIDUAL_BAGGING_FOLDS}")
 if TUNE["calib_bucketed"]:
     print(
         "TUNE: bucketed calibration enabled "
@@ -2889,6 +2892,175 @@ def train_residual_ssm(emb_full, first_pass_flat, Y_full,
     return model, correction_weight
 
 
+def train_residual_ssm_kfold(
+    emb_full,
+    first_pass_flat,
+    Y_full,
+    site_ids,
+    hour_ids,
+    file_names,
+    n_splits=5,
+    n_epochs=30,
+    patience=8,
+    lr=1e-3,
+    d_model=64,
+    d_state=8,
+    meta_dim=8,
+    dropout=0.1,
+    correction_weight=0.30,
+    verbose=False,
+):
+    """Train residual models on GroupKFold splits and return CPU state dicts."""
+    n_files = len(emb_full) // N_WINDOWS
+    if n_splits <= 1 or n_files < 3:
+        model, cw = train_residual_ssm(
+            emb_full=emb_full,
+            first_pass_flat=first_pass_flat,
+            Y_full=Y_full,
+            site_ids=site_ids,
+            hour_ids=hour_ids,
+            n_epochs=n_epochs,
+            patience=patience,
+            lr=lr,
+            d_model=d_model,
+            d_state=d_state,
+            meta_dim=meta_dim,
+            dropout=dropout,
+            correction_weight=correction_weight,
+            verbose=verbose,
+        )
+        state = {k: v.detach().cpu() for k, v in model.state_dict().items()}
+        return [state], cw
+
+    emb_f = emb_full.reshape(n_files, N_WINDOWS, -1)
+    fp_f = first_pass_flat.reshape(n_files, N_WINDOWS, -1)
+    lab_f = Y_full.reshape(n_files, N_WINDOWS, -1).astype(np.float32)
+    fp_prob = 1.0 / (1.0 + np.exp(-np.clip(fp_f, -30, 30)))
+    residuals = lab_f - fp_prob
+
+    print(
+        f"Residuals: mean={residuals.mean():.4f}  "
+        f"std={residuals.std():.4f}  "
+        f"abs_mean={np.abs(residuals).mean():.4f}"
+    )
+
+    emb_t = torch.tensor(emb_f, dtype=torch.float32, device=TORCH_DEVICE)
+    fp_t = torch.tensor(fp_f, dtype=torch.float32, device=TORCH_DEVICE)
+    res_t = torch.tensor(residuals, dtype=torch.float32, device=TORCH_DEVICE)
+    site_t = torch.tensor(site_ids, dtype=torch.long, device=TORCH_DEVICE)
+    hour_t = torch.tensor(hour_ids, dtype=torch.long, device=TORCH_DEVICE)
+
+    print(
+        f"ResidualSSM params: "
+        f"{ResidualSSM(n_classes=N_CLASSES, n_sites=20, d_model=d_model, d_state=d_state, meta_dim=meta_dim, dropout=dropout).count_parameters():,} "
+        f"(d_model={d_model}, d_state={d_state}, meta_dim={meta_dim}, dropout={dropout})"
+    )
+
+    file_groups = np.asarray(file_names)
+    splits = min(int(n_splits), int(n_files))
+    gkf = GroupKFold(n_splits=splits)
+    state_list = []
+    fold_best = []
+
+    for fold, (train_i, val_i) in enumerate(gkf.split(np.arange(n_files), groups=file_groups), 1):
+        model = ResidualSSM(
+            n_classes=N_CLASSES,
+            n_sites=20,
+            d_model=d_model,
+            d_state=d_state,
+            meta_dim=meta_dim,
+            dropout=dropout,
+        ).to(TORCH_DEVICE)
+
+        opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-3)
+        sched = torch.optim.lr_scheduler.OneCycleLR(
+            opt,
+            max_lr=lr,
+            epochs=n_epochs,
+            steps_per_epoch=1,
+            pct_start=0.1,
+            anneal_strategy="cos",
+        )
+
+        best_loss, best_state, wait = float("inf"), None, 0
+        effective_patience = n_epochs + 1 if DISABLE_EARLY_STOP else patience
+        early_stopped = False
+        epochs_ran = 0
+
+        for ep in range(n_epochs):
+            epochs_ran = ep + 1
+            model.train()
+            corr = model(
+                emb_t[train_i],
+                fp_t[train_i],
+                site_ids=site_t[train_i],
+                hours=hour_t[train_i],
+            )
+            loss = F.mse_loss(corr, res_t[train_i])
+            opt.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            opt.step()
+            sched.step()
+
+            model.eval()
+            with torch.no_grad():
+                val_corr = model(
+                    emb_t[val_i],
+                    fp_t[val_i],
+                    site_ids=site_t[val_i],
+                    hours=hour_t[val_i],
+                )
+                val_loss = F.mse_loss(val_corr, res_t[val_i])
+
+            if val_loss.item() < best_loss:
+                best_loss = val_loss.item()
+                best_state = {k: v.clone() for k, v in model.state_dict().items()}
+                wait = 0
+            else:
+                wait += 1
+            if wait >= effective_patience:
+                if verbose:
+                    print(f"  Residual fold {fold}: early stop ep {ep+1}")
+                early_stopped = True
+                break
+
+        model.load_state_dict(best_state)
+        state_list.append({k: v.detach().cpu() for k, v in model.state_dict().items()})
+        fold_best.append(best_loss)
+        print(
+            f"Residual fold {fold}/{splits} trained -best val MSE={best_loss:.6f} "
+            f"| epochs_ran={epochs_ran}/{n_epochs} | early_stop={early_stopped}"
+        )
+
+    corr_acc = np.zeros((n_files, N_WINDOWS, N_CLASSES), dtype=np.float32)
+    for state in state_list:
+        model = ResidualSSM(
+            n_classes=N_CLASSES,
+            n_sites=20,
+            d_model=d_model,
+            d_state=d_state,
+            meta_dim=meta_dim,
+            dropout=dropout,
+        ).to(TORCH_DEVICE)
+        model.load_state_dict(state, strict=True)
+        model.eval()
+        with torch.no_grad():
+            all_corr = model(emb_t, fp_t, site_ids=site_t, hours=hour_t).detach().cpu().numpy()
+        corr_acc += all_corr.astype(np.float32, copy=False)
+    corr_avg = corr_acc / float(len(state_list))
+    print(
+        f"ResidualSSM kfold trained -folds={len(state_list)} "
+        f"| best val MSE mean={float(np.mean(fold_best)):.6f}"
+    )
+    print(
+        f"Correction magnitude: mean_abs={np.abs(corr_avg).mean():.4f}  "
+        f"max={np.abs(corr_avg).max():.4f}"
+    )
+
+    return state_list, correction_weight
+
+
 print("[OK] ResidualSSM defined (~439K params, ~20s training)")
 
 # ===== Cell 22 =====
@@ -3347,6 +3519,7 @@ ENSEMBLE_W = float(TUNE["ensemble_w"])
 ENSEMBLE_W_VEC = None
 STACKER = None
 FOLD_BAGGING_ARTIFACTS = None
+RES_MODELS = []
 
 if LOAD_FROM_CKPT:
     print(f"Loading pipeline checkpoint: {CKPT_PATH}")
@@ -3412,17 +3585,33 @@ if LOAD_FROM_CKPT:
     proto_model.load_state_dict(proto_sd, strict=True)
     proto_model.eval()
 
-    res_model = ResidualSSM(
-        n_classes=N_CLASSES,
-        n_sites=n_sites_cap,
-        d_model=res_d_model,
-        d_state=res_d_state,
-        meta_dim=res_meta_dim,
-        dropout=res_dropout,
-    ).to(TORCH_DEVICE)
-    res_sd = _sanitize_torch_state_dict(ckpt["residual_state_dict"])
-    res_model.load_state_dict(res_sd, strict=True)
-    res_model.eval()
+    res_sd_list = ckpt.get("residual_state_dict_list")
+    if res_sd_list:
+        for _sd in res_sd_list:
+            _m = ResidualSSM(
+                n_classes=N_CLASSES,
+                n_sites=n_sites_cap,
+                d_model=res_d_model,
+                d_state=res_d_state,
+                meta_dim=res_meta_dim,
+                dropout=res_dropout,
+            ).to(TORCH_DEVICE)
+            _m.load_state_dict(_sanitize_torch_state_dict(_sd), strict=True)
+            _m.eval()
+            RES_MODELS.append(_m)
+    else:
+        _m = ResidualSSM(
+            n_classes=N_CLASSES,
+            n_sites=n_sites_cap,
+            d_model=res_d_model,
+            d_state=res_d_state,
+            meta_dim=res_meta_dim,
+            dropout=res_dropout,
+        ).to(TORCH_DEVICE)
+        res_sd = _sanitize_torch_state_dict(ckpt["residual_state_dict"])
+        _m.load_state_dict(res_sd, strict=True)
+        _m.eval()
+        RES_MODELS.append(_m)
 
     if STACKER is not None:
         ens_msg = "stacking"
@@ -3439,7 +3628,8 @@ if LOAD_FROM_CKPT:
         f"| n_sites_cap={n_sites_cap} | alpha_blend={alpha_blend:.3f} "
         f"| ensemble={ens_msg} "
         f"| proto_arch(d_model={proto_d_model},d_state={proto_d_state},layers={proto_n_layers},heads={proto_cross_attn_heads}) "
-        f"| res_arch(d_model={res_d_model},d_state={res_d_state})"
+        f"| res_arch(d_model={res_d_model},d_state={res_d_state}) "
+        f"| res_models={len(RES_MODELS)}"
     )
 else:
     if fold_bagging_artifacts:
@@ -3572,22 +3762,57 @@ else:
     )
 
     t0 = time.time()
-    res_model, correction_weight = train_residual_ssm(
-        emb_full=emb_tr,
-        first_pass_flat=first_pass_tr,
-        Y_full=Y_FULL_aligned,
-        site_ids=tr_site_ids,
-        hour_ids=tr_hour_ids,
-        n_epochs=TUNE["res_epochs"],
-        patience=TUNE["res_patience"],
-        lr=TUNE["res_lr"],
-        d_model=TUNE["res_d_model"],
-        d_state=TUNE["res_d_state"],
-        meta_dim=TUNE["res_meta_dim"],
-        dropout=TUNE["res_dropout"],
-        correction_weight=TUNE["res_correction_weight"],
-        verbose=False,
-    )
+    if RESIDUAL_BAGGING_FOLDS > 1:
+        res_state_list, correction_weight = train_residual_ssm_kfold(
+            emb_full=emb_tr,
+            first_pass_flat=first_pass_tr,
+            Y_full=Y_FULL_aligned,
+            site_ids=tr_site_ids,
+            hour_ids=tr_hour_ids,
+            file_names=tr_fnames,
+            n_splits=RESIDUAL_BAGGING_FOLDS,
+            n_epochs=TUNE["res_epochs"],
+            patience=TUNE["res_patience"],
+            lr=TUNE["res_lr"],
+            d_model=TUNE["res_d_model"],
+            d_state=TUNE["res_d_state"],
+            meta_dim=TUNE["res_meta_dim"],
+            dropout=TUNE["res_dropout"],
+            correction_weight=TUNE["res_correction_weight"],
+            verbose=False,
+        )
+        RES_MODELS = []
+        for _sd in res_state_list:
+            _m = ResidualSSM(
+                n_classes=N_CLASSES,
+                n_sites=n_sites_cap,
+                d_model=TUNE["res_d_model"],
+                d_state=TUNE["res_d_state"],
+                meta_dim=TUNE["res_meta_dim"],
+                dropout=TUNE["res_dropout"],
+            ).to(TORCH_DEVICE)
+            _m.load_state_dict(_sd, strict=True)
+            _m.eval()
+            RES_MODELS.append(_m)
+        res_model = RES_MODELS[0]
+    else:
+        res_model, correction_weight = train_residual_ssm(
+            emb_full=emb_tr,
+            first_pass_flat=first_pass_tr,
+            Y_full=Y_FULL_aligned,
+            site_ids=tr_site_ids,
+            hour_ids=tr_hour_ids,
+            n_epochs=TUNE["res_epochs"],
+            patience=TUNE["res_patience"],
+            lr=TUNE["res_lr"],
+            d_model=TUNE["res_d_model"],
+            d_state=TUNE["res_d_state"],
+            meta_dim=TUNE["res_meta_dim"],
+            dropout=TUNE["res_dropout"],
+            correction_weight=TUNE["res_correction_weight"],
+            verbose=False,
+        )
+        RES_MODELS = [res_model]
     print(f"ResidualSSM training: {time.time()-t0:.1f}s")
 
     if SAVE_TO_CKPT:
@@ -3608,6 +3833,10 @@ else:
                     "cross_attn_heads": int(TUNE["proto_cross_attn_heads"]),
                 },
                 "residual_state_dict": res_model.state_dict(),
+                "residual_state_dict_list": [
+                    {k: v.detach().cpu() for k, v in _m.state_dict().items()}
+                    for _m in RES_MODELS
+                ],
                 "res_arch": {
                     "d_model": int(TUNE["res_d_model"]),
                     "d_state": int(TUNE["res_d_state"]),
@@ -3706,14 +3935,25 @@ else:
     )
 
 first_pass_te_f  = first_pass_flat.reshape(n_test_files, N_WINDOWS, -1)
-res_model.eval()
-with torch.no_grad():
-    test_correction = res_model(
-        torch.tensor(emb_te_f,         dtype=torch.float32, device=TORCH_DEVICE),
-        torch.tensor(first_pass_te_f,  dtype=torch.float32, device=TORCH_DEVICE),
-        site_ids=torch.tensor(test_site_ids, dtype=torch.long, device=TORCH_DEVICE),
-        hours   =torch.tensor(test_hour_ids, dtype=torch.long, device=TORCH_DEVICE),
-    ).detach().cpu().numpy()
+test_correction = None
+for _mi, _res_model in enumerate(RES_MODELS, 1):
+    _res_model.eval()
+    with torch.no_grad():
+        _corr = _res_model(
+            torch.tensor(emb_te_f, dtype=torch.float32, device=TORCH_DEVICE),
+            torch.tensor(first_pass_te_f, dtype=torch.float32, device=TORCH_DEVICE),
+            site_ids=torch.tensor(test_site_ids, dtype=torch.long, device=TORCH_DEVICE),
+            hours=torch.tensor(test_hour_ids, dtype=torch.long, device=TORCH_DEVICE),
+        ).detach().cpu().numpy()
+    if test_correction is None:
+        test_correction = _corr.astype(np.float32, copy=False)
+    else:
+        test_correction += _corr.astype(np.float32, copy=False)
+if test_correction is None:
+    raise RuntimeError("Residual model list is empty.")
+if len(RES_MODELS) > 1:
+    test_correction /= float(len(RES_MODELS))
+    print(f"[INFO] Residual bagging applied from {len(RES_MODELS)} models")
 
 correction_flat = test_correction.reshape(-1, N_CLASSES).astype(np.float32)
 final_scores    = (first_pass_flat
