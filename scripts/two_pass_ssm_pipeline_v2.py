@@ -326,6 +326,7 @@ STACKING_LOGREG_C = _env_float("BC26_STACKING_LOGREG_C", 1.0)
 BAGGING_FOLDS = _env_int("BC26_BAGGING_FOLDS", 1)
 RESIDUAL_USE_OOF_FIRST_PASS = _env_bool("BC26_RESIDUAL_USE_OOF_FIRST_PASS", False)
 RESIDUAL_BAGGING_FOLDS = _env_int("BC26_RESIDUAL_BAGGING_FOLDS", 1)
+DUAL_TRACK_ENABLE = _env_bool("BC26_DUAL_TRACK_ENABLE", False)
 
 np.random.seed(GLOBAL_SEED)
 random.seed(GLOBAL_SEED)
@@ -407,6 +408,7 @@ if RESIDUAL_USE_OOF_FIRST_PASS:
     print("TUNE: residual training uses OOF first-pass logits via BC26_RESIDUAL_USE_OOF_FIRST_PASS=1")
 if RESIDUAL_BAGGING_FOLDS > 1:
     print(f"TUNE: residual fold bagging enabled via BC26_RESIDUAL_BAGGING_FOLDS={RESIDUAL_BAGGING_FOLDS}")
+print(f"TUNE: dual-track active/inactive={'on' if DUAL_TRACK_ENABLE else 'off'} via BC26_DUAL_TRACK_ENABLE")
 if TUNE["calib_bucketed"]:
     print(
         "TUNE: bucketed calibration enabled "
@@ -847,7 +849,10 @@ if missing_rows:
     )
 
 Y_FULL_aligned = Y_SC[row_id_to_index.loc[meta_tr["row_id"]].to_numpy()]
-ACTIVE_CLASS_MASK = (Y_FULL_aligned.sum(axis=0) > 0)
+if DUAL_TRACK_ENABLE:
+    ACTIVE_CLASS_MASK = (Y_FULL_aligned.sum(axis=0) > 0)
+else:
+    ACTIVE_CLASS_MASK = np.ones(N_CLASSES, dtype=bool)
 INACTIVE_CLASS_MASK = ~ACTIVE_CLASS_MASK
 ACTIVE_CLASS_IDX = np.where(ACTIVE_CLASS_MASK)[0]
 INACTIVE_CLASS_IDX = np.where(INACTIVE_CLASS_MASK)[0]
