@@ -3124,6 +3124,22 @@ def run_pipeline_oof(emb_full, sc_full, Y_full, meta_full, n_splits=5):
         sc_va_f = sc_full[va_mask]
         meta_va_f = meta_full[va_mask].reset_index(drop=True)
 
+        prior_tables_fold = build_prior_tables(sc_tr_f, Y_tr_f)
+        sc_tr_prior_fold = apply_prior(
+            sc_tr_f,
+            sites=meta_tr_f["site"].to_numpy(),
+            hours=meta_tr_f["hour_utc"].to_numpy(),
+            tables=prior_tables_fold,
+            lambda_prior=TUNE["prior_lambda"],
+        )
+        sc_va_prior_fold = apply_prior(
+            sc_va_f,
+            sites=meta_va_f["site"].to_numpy(),
+            hours=meta_va_f["hour_utc"].to_numpy(),
+            tables=prior_tables_fold,
+            lambda_prior=TUNE["prior_lambda"],
+        )
+
         proto_model, site2i = train_light_proto_ssm(
             emb_tr_f,
             sc_tr_f,
@@ -3195,7 +3211,7 @@ def run_pipeline_oof(emb_full, sc_full, Y_full, meta_full, n_splits=5):
 
         probe_models, emb_scaler, emb_pca, alpha_blend = train_mlp_probes(
             emb_tr_f,
-            sc_tr_f,
+            sc_tr_prior_fold,
             Y_tr_f,
             min_pos=TUNE["mlp_min_pos"],
             pca_dim=TUNE["mlp_pca_dim"],
@@ -3204,7 +3220,7 @@ def run_pipeline_oof(emb_full, sc_full, Y_full, meta_full, n_splits=5):
 
         sc_va_mlp = apply_mlp_probes_vectorized(
             emb_va_f,
-            sc_va_f,
+            sc_va_prior_fold,
             probe_models,
             emb_scaler,
             emb_pca,
@@ -3264,7 +3280,7 @@ def run_pipeline_oof(emb_full, sc_full, Y_full, meta_full, n_splits=5):
                 ).detach().cpu().numpy().reshape(-1, N_CLASSES)
             sc_tr_mlp_fold = apply_mlp_probes_vectorized(
                 emb_tr_f,
-                sc_tr_f,
+                sc_tr_prior_fold,
                 probe_models,
                 emb_scaler,
                 emb_pca,
@@ -3298,6 +3314,7 @@ def run_pipeline_oof(emb_full, sc_full, Y_full, meta_full, n_splits=5):
                     },
                     "site2i": dict(site2i),
                     "probe_models": probe_models,
+                    "prior_tables": prior_tables_fold,
                     "emb_scaler": emb_scaler,
                     "emb_pca": emb_pca,
                     "alpha_blend": float(alpha_blend),
@@ -3477,9 +3494,16 @@ def _predict_test_first_pass_from_fold_artifacts(emb_te, sc_te, meta_te, artifac
                 hours=torch.tensor(test_hour_ids, dtype=torch.long, device=TORCH_DEVICE),
             ).detach().cpu().numpy()
         proto_flat = proto_out.reshape(-1, N_CLASSES).astype(np.float32)
+        sc_te_prior_fold = apply_prior(
+            sc_te,
+            sites=meta_te["site"].to_numpy(),
+            hours=meta_te["hour_utc"].to_numpy(),
+            tables=art["prior_tables"],
+            lambda_prior=TUNE["prior_lambda"],
+        )
         mlp_flat = apply_mlp_probes_vectorized(
             emb_te,
-            sc_te,
+            sc_te_prior_fold,
             art["probe_models"],
             art["emb_scaler"],
             art["emb_pca"],
